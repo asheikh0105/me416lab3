@@ -5,6 +5,7 @@ function multiRobotSimulator()
 % (1 "real" robot + 11 digital twins) all running the same controller code.
 % Each robot has randomly assigned start and goal positions.
 % OPEN SPACE - no static obstacles, robots only avoid each other
+% PHYSICAL BOUNDARIES - Each robot has a 30cm x 40cm rectangular body
 
     clearvars; close all;
     rng(42); % Set random seed for reproducibility
@@ -15,6 +16,10 @@ function multiRobotSimulator()
     SIM.dt = 1/30; % Time step [s] (30 Hz control rate)
     SIM.mapSize = [5.5, 5.0]; % [width, height] in meters
     SIM.realTimeMode = true; % Set to true for real-time visualization
+    
+    %% ROBOT PHYSICAL DIMENSIONS
+    SIM.robotWidth = 0.30;   % 30 cm width (perpendicular to heading)
+    SIM.robotLength = 0.40;  % 40 cm length (parallel to heading)
     
     %% CONTROLLER CONFIGURATION (same as real robot)
     CFG.lookaheadDist = 0.35;
@@ -33,10 +38,11 @@ function multiRobotSimulator()
     CFG.rrtGoalBias = 0.15;
     CFG.rrtNeighborRadius = 0.8;
     
-    % Dynamic obstacle parameters
-    CFG.robotSafetyRadius = 0.35;
-    CFG.predictionHorizon = 3.0;
-    CFG.velocityScaleFactor = 1.5;
+    % Dynamic obstacle parameters (adjusted for rectangular bodies)
+    CFG.robotSafetyMargin = 0.15;     % Extra safety margin around robot body [m]
+    CFG.predictionHorizon = 3.0;      % How far ahead to predict robot motion [s]
+    CFG.velocityScaleFactor = 2.0;    % Scale velocity for elongated keepout zones
+    CFG.obstacleInflation = 2.0;      % Inflate obstacles for safer planning
     
     % Kalman filter parameters
     CFG.kf_processNoise = 0.1;
@@ -46,10 +52,10 @@ function multiRobotSimulator()
     staticObstacles = []; % Empty - robots only avoid each other
     
     %% INITIALIZE ROBOTS
-    fprintf('Initializing %d robots in open space...\n', SIM.numRobots);
+    fprintf('Initializing %d robots with 30cm x 40cm bodies in open space...\n', SIM.numRobots);
     robots = struct();
     
-    % Define margin from edges
+    % Define margin from edges (account for robot size)
     edgeMargin = 0.5;
     
     for i = 1:SIM.numRobots
@@ -61,14 +67,15 @@ function multiRobotSimulator()
         while ~validStart && attempts < 100
             x = edgeMargin + rand * (SIM.mapSize(1) - 2*edgeMargin);
             y = edgeMargin + rand * (SIM.mapSize(2) - 2*edgeMargin);
+            theta = rand * 2 * pi; % Random initial heading
             
-            % Check distance to other robots
+            % Check distance to other robots (use conservative circular approximation for initialization)
             validStart = true;
             existingIds = fieldnames(robots);
             for j = 1:length(existingIds)
                 dist = sqrt((x - robots.(existingIds{j}).pose(1))^2 + ...
                            (y - robots.(existingIds{j}).pose(2))^2);
-                if dist < 0.8
+                if dist < 1.0  % Conservative separation for initialization
                     validStart = false;
                     break;
                 end
@@ -92,7 +99,6 @@ function multiRobotSimulator()
         end
         
         % Initialize robot state
-        theta = rand * 2 * pi; % Random initial heading
         robots.(robotId).pose = [x, y, theta]; % [x, y, theta]
         robots.(robotId).velocity = [0, 0]; % [vx, vy]
         robots.(robotId).goal = [gx; gy];
@@ -119,12 +125,13 @@ function multiRobotSimulator()
         robots.(robotId).kf_Q = Q;
         robots.(robotId).kf_R = eye(2) * CFG.kf_measureNoise;
         
-        fprintf('  %s: Start(%.2f, %.2f) -> Goal(%.2f, %.2f)\n', ...
-                robotId, x, y, gx, gy);
+        fprintf('  %s: Start(%.2f, %.2f, %.0f°) -> Goal(%.2f, %.2f)\n', ...
+                robotId, x, y, rad2deg(theta), gx, gy);
     end
     
     %% VISUALIZATION SETUP
-    figure('Name', 'Multi-Robot Simulation - Live View', 'Position', [50 50 1400 900]);
+    figure('Name', 'Multi-Robot Simulation - Live View with Physical Bodies', ...
+           'Position', [50 50 1400 900]);
     
     % Color map for robots
     colors = lines(SIM.numRobots);
@@ -154,26 +161,27 @@ function multiRobotSimulator()
         % Trajectory line
         plotHandles.(rid).traj = plot(NaN, NaN, ':', 'Color', col, 'LineWidth', 2.0);
         
-        % Robot position (larger for visibility)
+        % Robot center position (small dot)
         plotHandles.(rid).robot = plot(NaN, NaN, 'o', 'Color', col, ...
-                                       'MarkerSize', 12, 'MarkerFaceColor', col);
+                                       'MarkerSize', 6, 'MarkerFaceColor', col);
         
-        % Robot heading indicator
-        plotHandles.(rid).heading = plot(NaN, NaN, '-', 'Color', col, 'LineWidth', 2.5);
+        % Robot body (30cm x 40cm rectangle)
+        plotHandles.(rid).body = patch('XData', NaN, 'YData', NaN, ...
+                                       'FaceColor', col, 'FaceAlpha', 0.5, ...
+                                       'EdgeColor', col, 'LineWidth', 2);
         
-        % Safety radius circle
-        theta_circle = linspace(0, 2*pi, 30);
-        plotHandles.(rid).safetyCircle = plot(NaN, NaN, ':', 'Color', [col 0.2], 'LineWidth', 1);
+        % Robot heading indicator (arrow)
+        plotHandles.(rid).heading = plot(NaN, NaN, '-', 'Color', col, 'LineWidth', 3);
     end
     
     xlabel('X Position [m]'); ylabel('Y Position [m]');
-    title('Multi-Robot Simulation - Real-Time Path Planning (Open Space)');
+    title('Multi-Robot Simulation - Real-Time Path Planning with Physical Bodies (30cm x 40cm)');
     xlim([-0.5, SIM.mapSize(1)]); ylim([-0.5, SIM.mapSize(2)]);
     
     %% SIMULATION LOOP
     if SIM.realTimeMode
         fprintf('\nStarting REAL-TIME simulation...\n');
-        fprintf('Watch the robots navigate in real-time!\n\n');
+        fprintf('Watch the robots navigate with physical body constraints!\n\n');
     else
         fprintf('\nStarting FAST simulation...\n\n');
     end
@@ -233,12 +241,14 @@ function multiRobotSimulator()
             
             % Path replanning
             if (simTime - robots.(rid).lastReplanTime) >= CFG.replanInterval
-                % Create dynamic obstacles from other robots
+                % Create dynamic obstacles from other robots (with rectangular bodies)
                 otherRobotsList = createOtherRobotsList(robots, rid, CFG);
-                obstacles = createDynamicObstaclesSim(staticObstacles, otherRobotsList, CFG);
+                obstacles = createDynamicObstaclesSim(staticObstacles, otherRobotsList, ...
+                                                     CFG, SIM.robotWidth, SIM.robotLength);
                 
                 % Run RRT* planner
-                newPath = rrtStarPlanner(robots.(rid).pose, robots.(rid).goal, obstacles, CFG, SIM.mapSize);
+                newPath = rrtStarPlanner(robots.(rid).pose, robots.(rid).goal, obstacles, ...
+                                        CFG, SIM.mapSize, SIM.robotWidth, SIM.robotLength);
                 
                 if ~isempty(newPath)
                     robots.(rid).path = smoothPathSim(newPath, CFG.minTurnRadius);
@@ -306,27 +316,45 @@ function multiRobotSimulator()
             for i = 1:length(robotIds)
                 rid = robotIds{i};
                 
-                % Update robot position
-                set(plotHandles.(rid).robot, 'XData', robots.(rid).pose(1), ...
-                    'YData', robots.(rid).pose(2));
+                x = robots.(rid).pose(1);
+                y = robots.(rid).pose(2);
+                theta = robots.(rid).pose(3);
                 
-                % Update heading indicator
-                headingLen = 0.25;
-                hx = [robots.(rid).pose(1), robots.(rid).pose(1) + headingLen * cos(robots.(rid).pose(3))];
-                hy = [robots.(rid).pose(2), robots.(rid).pose(2) + headingLen * sin(robots.(rid).pose(3))];
+                % Update robot center position
+                set(plotHandles.(rid).robot, 'XData', x, 'YData', y);
+                
+                % Calculate rectangle corners (30cm width x 40cm length)
+                % Rectangle centered at robot position
+                halfWidth = SIM.robotWidth / 2;
+                halfLength = SIM.robotLength / 2;
+                
+                % Local coordinates (before rotation)
+                local_corners = [-halfLength, -halfWidth;   % Back left
+                                 halfLength,  -halfWidth;   % Front left
+                                 halfLength,   halfWidth;   % Front right
+                                 -halfLength,  halfWidth];  % Back right
+                
+                % Rotation matrix
+                R = [cos(theta), -sin(theta);
+                     sin(theta),  cos(theta)];
+                
+                % Rotate and translate corners
+                global_corners = (R * local_corners')';
+                rectX = global_corners(:,1) + x;
+                rectY = global_corners(:,2) + y;
+                
+                % Update rectangle body
+                set(plotHandles.(rid).body, 'XData', rectX, 'YData', rectY);
+                
+                % Update heading indicator (arrow from center to front)
+                headingLen = SIM.robotLength / 2 + 0.1;
+                hx = [x, x + headingLen * cos(theta)];
+                hy = [y, y + headingLen * sin(theta)];
                 set(plotHandles.(rid).heading, 'XData', hx, 'YData', hy);
                 
                 % Update trajectory
                 set(plotHandles.(rid).traj, 'XData', robots.(rid).trajectory(:,1), ...
                     'YData', robots.(rid).trajectory(:,2));
-                
-                % Update safety circle
-                if ~robots.(rid).reached
-                    theta_circle = linspace(0, 2*pi, 30);
-                    circleX = robots.(rid).pose(1) + CFG.robotSafetyRadius * cos(theta_circle);
-                    circleY = robots.(rid).pose(2) + CFG.robotSafetyRadius * sin(theta_circle);
-                    set(plotHandles.(rid).safetyCircle, 'XData', circleX, 'YData', circleY);
-                end
             end
             
             % Count reached robots properly
@@ -338,7 +366,7 @@ function multiRobotSimulator()
             end
             
             % Update title with stats
-            title(sprintf('Multi-Robot Simulation | t=%.1fs | Robots: %d/%d reached goal', ...
+            title(sprintf('Multi-Robot Simulation | t=%.1fs | Robots: %d/%d reached goal | Bodies: 30cm x 40cm', ...
                          simTime, numReached, SIM.numRobots));
             drawnow limitrate;
         end
@@ -402,13 +430,14 @@ function otherRobotsList = createOtherRobotsList(robots, myRobotId, CFG)
         otherRobot.y = robots.(rid).kf_state(2);
         otherRobot.vx = robots.(rid).kf_state(3);
         otherRobot.vy = robots.(rid).kf_state(4);
+        otherRobot.theta = robots.(rid).pose(3); % Include heading for rectangular body
         
         otherRobotsList = [otherRobotsList; otherRobot];
     end
 end
 
-%% HELPER: CREATE DYNAMIC OBSTACLES (SIMULATOR VERSION)
-function obstacles = createDynamicObstaclesSim(staticObstacles, otherRobotsList, CFG)
+%% HELPER: CREATE DYNAMIC OBSTACLES (SIMULATOR VERSION WITH RECTANGULAR BODIES)
+function obstacles = createDynamicObstaclesSim(staticObstacles, otherRobotsList, CFG, robotWidth, robotLength)
     obstacles = [];
     obstacleCount = 0;
     
@@ -418,37 +447,82 @@ function obstacles = createDynamicObstaclesSim(staticObstacles, otherRobotsList,
         obstacles(obstacleCount).x = staticObstacles(1, i);
         obstacles(obstacleCount).y = staticObstacles(2, i);
         obstacles(obstacleCount).radius = 0.15;
+        obstacles(obstacleCount).type = 'circle';
     end
     
-    % Add dynamic robot obstacles
+    % Add dynamic robot obstacles as grid of circles covering the rectangular body
     for i = 1:length(otherRobotsList)
         robot = otherRobotsList(i);
-        
-        % Current position
-        obstacleCount = obstacleCount + 1;
-        obstacles(obstacleCount).x = robot.x;
-        obstacles(obstacleCount).y = robot.y;
         speed = sqrt(robot.vx^2 + robot.vy^2);
-        obstacles(obstacleCount).radius = CFG.robotSafetyRadius + speed * CFG.velocityScaleFactor * 0.5;
         
-        % Predicted positions
+        % Create a dense grid of circular obstacles to fully cover the rectangle
+        % This ensures no part of the rectangle can be penetrated
+        numCirclesLength = 7; % More circles along length for better coverage
+        numCirclesWidth = 5;  % Circles along width
+        
+        % Base radius sized to ensure overlap between circles
+        baseRadius = max(robotWidth, robotLength) / 6 + CFG.robotSafetyMargin;
+        
+        % Cover the entire rectangular footprint with overlapping circles
+        for jL = 0:numCirclesLength-1
+            for jW = 0:numCirclesWidth-1
+                % Position in local robot frame
+                offsetLength = (jL / (numCirclesLength-1) - 0.5) * robotLength;
+                offsetWidth = (jW / (numCirclesWidth-1) - 0.5) * robotWidth;
+                
+                % Transform to global frame
+                localX = offsetLength;
+                localY = offsetWidth;
+                globalX = robot.x + localX * cos(robot.theta) - localY * sin(robot.theta);
+                globalY = robot.y + localX * sin(robot.theta) + localY * cos(robot.theta);
+                
+                obstacleCount = obstacleCount + 1;
+                obstacles(obstacleCount).x = globalX;
+                obstacles(obstacleCount).y = globalY;
+                obstacles(obstacleCount).radius = baseRadius * CFG.obstacleInflation;
+                obstacles(obstacleCount).type = 'circle';
+            end
+        end
+        
+        % Add predicted positions with full body coverage
         if speed > 0.02
-            numPredictions = 5;
+            numPredictions = 4;
             for j = 1:numPredictions
                 predTime = (j / numPredictions) * CFG.predictionHorizon;
-                obstacleCount = obstacleCount + 1;
-                obstacles(obstacleCount).x = robot.x + robot.vx * predTime;
-                obstacles(obstacleCount).y = robot.y + robot.vy * predTime;
-                obstacles(obstacleCount).radius = CFG.robotSafetyRadius + speed * CFG.velocityScaleFactor * (1 + j/numPredictions);
+                predX = robot.x + robot.vx * predTime;
+                predY = robot.y + robot.vy * predTime;
+                % Predict heading change based on angular velocity (approximate)
+                predTheta = robot.theta;
+                
+                % Add grid of circles for predicted position
+                for jL = 0:numCirclesLength-1
+                    for jW = 0:numCirclesWidth-1
+                        offsetLength = (jL / (numCirclesLength-1) - 0.5) * robotLength;
+                        offsetWidth = (jW / (numCirclesWidth-1) - 0.5) * robotWidth;
+                        
+                        localX = offsetLength;
+                        localY = offsetWidth;
+                        globalX = predX + localX * cos(predTheta) - localY * sin(predTheta);
+                        globalY = predY + localX * sin(predTheta) + localY * cos(predTheta);
+                        
+                        obstacleCount = obstacleCount + 1;
+                        obstacles(obstacleCount).x = globalX;
+                        obstacles(obstacleCount).y = globalY;
+                        % Increase radius for predictions (more uncertainty)
+                        obstacles(obstacleCount).radius = baseRadius * CFG.obstacleInflation * (1 + 0.4 * j/numPredictions);
+                        obstacles(obstacleCount).type = 'circle';
+                    end
+                end
             end
         end
     end
 end
 
-%% HELPER: RRT* PLANNER (SIMULATOR VERSION)
-function path = rrtStarPlanner(startPose, goalPos, obstacles, CFG, mapSize)
+%% HELPER: RRT* PLANNER (SIMULATOR VERSION WITH RECTANGULAR ROBOT)
+function path = rrtStarPlanner(startPose, goalPos, obstacles, CFG, mapSize, robotWidth, robotLength)
     tree(1).x = startPose(1);
     tree(1).y = startPose(2);
+    tree(1).theta = startPose(3);
     tree(1).parent = 0;
     tree(1).cost = 0;
     
@@ -457,6 +531,10 @@ function path = rrtStarPlanner(startPose, goalPos, obstacles, CFG, mapSize)
     
     xMin = 0; xMax = mapSize(1);
     yMin = 0; yMax = mapSize(2);
+    
+    % Robot collision radius - use diagonal of rectangle plus safety margin
+    % This ensures the entire robot body is safe when center follows path
+    robotRadius = sqrt((robotWidth/2)^2 + (robotLength/2)^2) + CFG.robotSafetyMargin * 2;
     
     for iter = 1:CFG.rrtMaxIter
         if rand < CFG.rrtGoalBias
@@ -476,7 +554,7 @@ function path = rrtStarPlanner(startPose, goalPos, obstacles, CFG, mapSize)
         xNew = xNearest + CFG.rrtStepSize * cos(angle);
         yNew = yNearest + CFG.rrtStepSize * sin(angle);
         
-        if ~isCollisionFreeSim(xNearest, yNearest, xNew, yNew, obstacles)
+        if ~isCollisionFreeSim(xNearest, yNearest, xNew, yNew, obstacles, robotRadius)
             continue;
         end
         
@@ -488,7 +566,7 @@ function path = rrtStarPlanner(startPose, goalPos, obstacles, CFG, mapSize)
         for i = 1:length(nearInds)
             idx = nearInds(i);
             cost = tree(idx).cost + sqrt((tree(idx).x - xNew)^2 + (tree(idx).y - yNew)^2);
-            if cost < minCost && isCollisionFreeSim(tree(idx).x, tree(idx).y, xNew, yNew, obstacles)
+            if cost < minCost && isCollisionFreeSim(tree(idx).x, tree(idx).y, xNew, yNew, obstacles, robotRadius)
                 minCost = cost;
                 bestParent = idx;
             end
@@ -497,13 +575,14 @@ function path = rrtStarPlanner(startPose, goalPos, obstacles, CFG, mapSize)
         newIdx = length(tree) + 1;
         tree(newIdx).x = xNew;
         tree(newIdx).y = yNew;
+        tree(newIdx).theta = atan2(yNew - tree(bestParent).y, xNew - tree(bestParent).x);
         tree(newIdx).parent = bestParent;
         tree(newIdx).cost = minCost;
         
         for i = 1:length(nearInds)
             idx = nearInds(i);
             cost = tree(newIdx).cost + sqrt((tree(idx).x - xNew)^2 + (tree(idx).y - yNew)^2);
-            if cost < tree(idx).cost && isCollisionFreeSim(xNew, yNew, tree(idx).x, tree(idx).y, obstacles)
+            if cost < tree(idx).cost && isCollisionFreeSim(xNew, yNew, tree(idx).x, tree(idx).y, obstacles, robotRadius)
                 tree(idx).parent = newIdx;
                 tree(idx).cost = cost;
             end
@@ -518,15 +597,15 @@ function path = rrtStarPlanner(startPose, goalPos, obstacles, CFG, mapSize)
     
     distances = sqrt(([tree.x] - goalX).^2 + ([tree.y] - goalY).^2);
     [minDist, closestIdx] = min(distances);
-    if minDist < 1.0
+    if minDist < 1.5  % Increased tolerance
         path = extractPathSim(tree, closestIdx);
     else
         path = [];
     end
 end
 
-%% HELPER: COLLISION CHECK
-function isFree = isCollisionFreeSim(x1, y1, x2, y2, obstacles)
+%% HELPER: COLLISION CHECK WITH ROBOT RADIUS
+function isFree = isCollisionFreeSim(x1, y1, x2, y2, obstacles, robotRadius)
     isFree = true;
     numChecks = 10;
     for i = 0:numChecks
@@ -536,7 +615,7 @@ function isFree = isCollisionFreeSim(x1, y1, x2, y2, obstacles)
         
         for j = 1:length(obstacles)
             dist = sqrt((x - obstacles(j).x)^2 + (y - obstacles(j).y)^2);
-            if dist < obstacles(j).radius
+            if dist < (obstacles(j).radius + robotRadius)
                 isFree = false;
                 return;
             end
