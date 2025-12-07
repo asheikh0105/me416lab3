@@ -2,678 +2,654 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass
 
-# === CONFIGURATION AND HELPER STRUCTURES (No change here) ===
+# === CONFIGURATION ===
 
+@dataclass
 class Config:
     """Controller and Planning Configuration Parameters."""
-    def __init__(self):
-        # Pure Pursuit Controller
-        self.lookaheadDist: float = 0.35
-        self.targetLinearVel: float = 0.25
-        self.minTurnRadius: float = 0.2
-        self.recoveryDuration: float = 1.0
-        self.posTolerance: float = 0.2
-        self.headingTolerance: float = np.deg2rad(25)
-        self.maxLinVel: float = 0.25
-        self.maxAngVel: float = np.deg2rad(60)
-
-        # 🤖 PHYSICAL ROBOT DIMENSIONS (40 cm x 30 cm)
-        self.robotWidth: float = 0.40  # 40 cm (transverse)
-        self.robotLength: float = 0.30  # 30 cm (longitudinal/heading)
-        self.safetyBuffer: float = 0.1 # Additional clearance buffer
-
-        # Calculate the clearance radius (radius of the circle that circumscribes the box + buffer)
-        R_box_diagonal = np.sqrt(self.robotWidth**2 + self.robotLength**2) / 2.0
-        self.robotClearanceRadius: float = R_box_diagonal + self.safetyBuffer
-        
-        # Path planning parameters (RRT*)
-        self.replanInterval: float = 1.0
-        self.rrtMaxIter: int = 500
-        self.rrtStepSize: float = 0.3
-        self.rrtGoalBias: float = 0.15
-        self.rrtNeighborRadius: float = 0.8
-
-        # Dynamic obstacle parameters (was CFG.robotSafetyRadius)
-        self.predictionHorizon: float = 3.0
-        self.velocityScaleFactor: float = 1.5
-
-        # Kalman filter parameters
-        self.kf_processNoise: float = 0.1
-        self.kf_measureNoise: float = 0.05
+    # Pure Pursuit Controller
+    lookaheadDist: float = 0.4
+    targetLinearVel: float = 0.3
+    maxLinVel: float = 0.3
+    maxAngVel: float = np.deg2rad(90)
+    
+    # Robot Dimensions (car-like)
+    robotLength: float = 0.40  # Wheelbase
+    robotWidth: float = 0.30
+    safetyBuffer: float = 0.15
+    
+    # Dubins Parameters
+    maxSteeringAngle: float = np.deg2rad(35)
+    
+    # Path planning - SWITCHED TO A* for speed
+    replanInterval: float = 0.5  # More frequent replanning
+    gridResolution: float = 0.15  # Grid cell size for A*
+    
+    # Dynamic obstacle parameters
+    predictionHorizon: float = 2.0
+    
+    # Local Collision Avoidance
+    coordinationHorizon: float = 1.5
+    stopDistance: float = 0.6
+    emergencyDistance: float = 0.4
+    
+    # Tolerances
+    posTolerance: float = 0.25
+    headingTolerance: float = np.deg2rad(30)
+    
+    def __post_init__(self):
+        """Calculate derived parameters."""
+        self.minTurnRadius = self.robotLength / np.tan(self.maxSteeringAngle)
+        # Clearance radius: diagonal of box + safety buffer
+        R_diag = np.sqrt(self.robotWidth**2 + self.robotLength**2) / 2.0
+        self.robotClearanceRadius = R_diag + self.safetyBuffer
+        self.safeSeparation = 2 * self.robotClearanceRadius
 
 class SimParams:
     """Simulation Parameters."""
     def __init__(self):
         self.numRobots: int = 12
-        self.maxTime: float = 300.0  # Maximum simulation time [s]
-        self.dt: float = 1.0 / 30.0  # Time step [s] (30 Hz control rate)
-        self.mapSize: np.ndarray = np.array([5.5, 5.0])  # [width, height] in meters
-        self.realTimeMode: bool = True  # Set to true for real-time visualization
+        self.maxTime: float = 300.0
+        self.dt: float = 1.0 / 30.0
+        self.mapSize: np.ndarray = np.array([5.5, 5.0])
+        self.realTimeMode: bool = True
+
+# === DATA STRUCTURES ===
 
 class Path:
-    """Represents a robot's planned path."""
     def __init__(self, x: np.ndarray, y: np.ndarray):
-        self.x: np.ndarray = x
-        self.y: np.ndarray = y
-        self.s: np.ndarray = self._calculate_arc_length(x, y)
-
+        self.x = x
+        self.y = y
+        self.s = self._calculate_arc_length(x, y)
+    
     @staticmethod
     def _calculate_arc_length(x: np.ndarray, y: np.ndarray) -> np.ndarray:
         dx = np.diff(x)
         dy = np.diff(y)
         ds = np.sqrt(dx**2 + dy**2)
-        s = np.insert(np.cumsum(ds), 0, 0.0)
-        return s
+        return np.insert(np.cumsum(ds), 0, 0.0)
 
 class RobotState:
-    """Represents a single robot's state and internal variables."""
-    def __init__(self, initial_pose: np.ndarray, goal: np.ndarray, initial_path: Path, cfg: Config):
-        self.pose: np.ndarray = initial_pose  # [x, y, theta]
-        self.velocity: np.ndarray = np.array([0.0, 0.0])  # [vx, vy]
-        self.goal: np.ndarray = goal  # [gx, gy]
-        self.trajectory: List[np.ndarray] = [initial_pose[:2].copy()]
-        self.reached: bool = False
-        self.reachedTime: float = np.inf
-        self.lastReplanTime: float = -np.inf
-        self.replanCount: int = 0
-        self.recoveryTimer: Optional[float] = None
-        self.errorHistory: List[float] = []
-        self.path: Path = initial_path
+    def __init__(self, initial_pose: np.ndarray, goal: np.ndarray, initial_path: Path):
+        self.pose = initial_pose.copy()
+        self.velocity = np.array([0.0, 0.0])
+        self.goal = goal
+        self.trajectory = [initial_pose[:2].copy()]
+        self.reached = False
+        self.reachedTime = np.inf
+        self.lastReplanTime = -np.inf
+        self.replanCount = 0
+        self.path = initial_path
+        self.stuckCounter = 0
+        self.lastPosition = initial_pose[:2].copy()
 
-        # Kalman filter tracking state [x, y, vx, vy]
-        self.kf_state: np.ndarray = np.array([initial_pose[0], initial_pose[1], 0.0, 0.0])
-        self.kf_P: np.ndarray = np.eye(4) * 0.1
-        Q = np.eye(4) * cfg.kf_processNoise
-        Q[:2, :2] = Q[:2, :2] * 0.1
-        self.kf_Q: np.ndarray = Q
-        self.kf_R: np.ndarray = np.eye(2) * cfg.kf_measureNoise
-
-class RRTNode:
-    """Node structure for the RRT* search tree."""
-    def __init__(self, x: float, y: float, parent: int, cost: float):
-        self.x: float = x
-        self.y: float = y
-        self.parent: int = parent
-        self.cost: float = cost
-
-class Obstacle:
-    """Represents a circular obstacle (static or dynamic prediction)."""
-    def __init__(self, x: float, y: float, radius: float):
-        self.x: float = x
-        self.y: float = y
-        self.radius: float = radius
-
-# === HELPER FUNCTIONS (No change here) ===
+# === HELPER FUNCTIONS ===
 
 def wrap_to_pi(angle: float) -> float:
     """Wraps an angle to the range (-pi, pi]."""
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
-def create_other_robots_list(robots: Dict[str, RobotState], my_robot_id: str) -> List[Dict[str, float]]:
-    """Creates a list of other robots' Kalman-filtered states for path planning."""
-    other_robots_list = []
-    for rid, robot in robots.items():
-        if rid == my_robot_id or robot.reached:
-            continue
-        
-        other_robots_list.append({
-            'x': robot.kf_state[0],
-            'y': robot.kf_state[1],
-            'vx': robot.kf_state[2],
-            'vy': robot.kf_state[3]
-        })
-    return other_robots_list
+def get_oriented_box_points(x: float, y: float, theta: float, length: float, width: float, num_points: int = 8) -> np.ndarray:
+    """Get points around the perimeter of an oriented bounding box."""
+    half_l, half_w = length / 2, width / 2
+    
+    # Create points around perimeter
+    perimeter_points = []
+    # Front edge
+    for i in range(num_points // 4):
+        t = i / (num_points // 4 - 1) if num_points > 4 else 0
+        perimeter_points.append([half_l, -half_w + t * 2 * half_w])
+    # Right edge
+    for i in range(num_points // 4):
+        t = i / (num_points // 4 - 1) if num_points > 4 else 0
+        perimeter_points.append([half_l - t * 2 * half_l, half_w])
+    # Back edge
+    for i in range(num_points // 4):
+        t = i / (num_points // 4 - 1) if num_points > 4 else 0
+        perimeter_points.append([-half_l, half_w - t * 2 * half_w])
+    # Left edge
+    for i in range(num_points // 4):
+        t = i / (num_points // 4 - 1) if num_points > 4 else 0
+        perimeter_points.append([-half_l + t * 2 * half_l, -half_w])
+    
+    local_points = np.array(perimeter_points).T
+    
+    # Rotation and translation
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+    global_points = R @ local_points
+    global_points[0, :] += x
+    global_points[1, :] += y
+    
+    return global_points.T
 
-def create_dynamic_obstacles_sim(other_robots_list: List[Dict[str, float]], cfg: Config) -> List[Obstacle]:
-    """Creates a list of dynamic obstacles based on other robots' predicted trajectories."""
-    obstacles: List[Obstacle] = []
-    # Static obstacles are an empty list in this simulator, so we skip that part.
+def check_box_collision(pose1: np.ndarray, pose2: np.ndarray, cfg: Config) -> bool:
+    """Check if two oriented bounding boxes collide using separating axis theorem."""
+    x1, y1, theta1 = pose1
+    x2, y2, theta2 = pose2
+    
+    # Quick distance check first
+    dist = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+    if dist > (cfg.robotLength + cfg.robotWidth):  # Conservative bound
+        return False
+    
+    # Get corner points
+    def get_corners(x, y, theta):
+        hl, hw = cfg.robotLength / 2, cfg.robotWidth / 2
+        corners = np.array([
+            [hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]
+        ])
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+        rotated = (R @ corners.T).T
+        return rotated + np.array([x, y])
+    
+    corners1 = get_corners(x1, y1, theta1)
+    corners2 = get_corners(x2, y2, theta2)
+    
+    # Separating Axis Theorem - test box1 axes and box2 axes
+    axes = [
+        np.array([np.cos(theta1), np.sin(theta1)]),
+        np.array([-np.sin(theta1), np.cos(theta1)]),
+        np.array([np.cos(theta2), np.sin(theta2)]),
+        np.array([-np.sin(theta2), np.cos(theta2)])
+    ]
+    
+    for axis in axes:
+        # Project all corners onto axis
+        proj1 = corners1 @ axis
+        proj2 = corners2 @ axis
+        
+        # Check for overlap
+        if proj1.max() < proj2.min() or proj2.max() < proj1.min():
+            return False  # Found separating axis - no collision
+    
+    return True  # No separating axis found - collision
 
-    # Add dynamic robot obstacles
-    for robot in other_robots_list:
-        x, y, vx, vy = robot['x'], robot['y'], robot['vx'], robot['vy']
-        speed = np.sqrt(vx**2 + vy**2)
+# === A* PATH PLANNER (Much faster than RRT*) ===
+
+class AStarPlanner:
+    """Grid-based A* planner with dynamic obstacle handling."""
+    
+    def __init__(self, map_size: np.ndarray, resolution: float, cfg: Config):
+        self.map_size = map_size
+        self.resolution = resolution
+        self.cfg = cfg
         
-        # Current position: Use the clearance radius
-        obstacles.append(Obstacle(x, y, cfg.robotClearanceRadius))
+        self.grid_width = int(np.ceil(map_size[0] / resolution))
+        self.grid_height = int(np.ceil(map_size[1] / resolution))
         
-        # Predicted positions (if moving)
-        if speed > 0.02:
-            num_predictions = 5
-            for j in range(1, num_predictions + 1):
-                pred_time = (j / num_predictions) * cfg.predictionHorizon
+        # 8-connectivity
+        self.motions = [
+            [1, 0, 1.0], [0, 1, 1.0], [-1, 0, 1.0], [0, -1, 1.0],
+            [1, 1, 1.414], [1, -1, 1.414], [-1, 1, 1.414], [-1, -1, 1.414]
+        ]
+    
+    def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
+        """Convert world coordinates to grid indices."""
+        gx = int(np.floor(x / self.resolution))
+        gy = int(np.floor(y / self.resolution))
+        return gx, gy
+    
+    def grid_to_world(self, gx: int, gy: int) -> Tuple[float, float]:
+        """Convert grid indices to world coordinates."""
+        x = (gx + 0.5) * self.resolution
+        y = (gy + 0.5) * self.resolution
+        return x, y
+    
+    def is_valid(self, gx: int, gy: int) -> bool:
+        """Check if grid cell is within bounds."""
+        return 0 <= gx < self.grid_width and 0 <= gy < self.grid_height
+    
+    def create_obstacle_map(self, other_robots: List[Dict]) -> np.ndarray:
+        """Create binary obstacle map from other robots."""
+        obstacle_map = np.zeros((self.grid_width, self.grid_height), dtype=bool)
+        
+        inflation_cells = int(np.ceil(self.cfg.robotClearanceRadius / self.resolution))
+        
+        for robot in other_robots:
+            # Current position
+            cx, cy = self.world_to_grid(robot['x'], robot['y'])
+            if self.is_valid(cx, cy):
+                for dx in range(-inflation_cells, inflation_cells + 1):
+                    for dy in range(-inflation_cells, inflation_cells + 1):
+                        gx, gy = cx + dx, cy + dy
+                        if self.is_valid(gx, gy):
+                            wx, wy = self.grid_to_world(gx, gy)
+                            dist = np.sqrt((wx - robot['x'])**2 + (wy - robot['y'])**2)
+                            if dist < self.cfg.robotClearanceRadius:
+                                obstacle_map[gx, gy] = True
+            
+            # Predicted positions
+            vx, vy = robot['vx'], robot['vy']
+            speed = np.sqrt(vx**2 + vy**2)
+            
+            if speed > 0.05:
+                pred_dist = speed * self.cfg.predictionHorizon
+                num_preds = max(3, int(pred_dist / self.resolution))
                 
-                pred_x = x + vx * pred_time
-                pred_y = y + vy * pred_time
+                for i in range(1, num_preds + 1):
+                    t = (i / num_preds) * self.cfg.predictionHorizon
+                    px = robot['x'] + vx * t
+                    py = robot['y'] + vy * t
+                    
+                    pgx, pgy = self.world_to_grid(px, py)
+                    if self.is_valid(pgx, pgy):
+                        pred_inflation = max(1, int(inflation_cells * 0.7))
+                        for dx in range(-pred_inflation, pred_inflation + 1):
+                            for dy in range(-pred_inflation, pred_inflation + 1):
+                                gx, gy = pgx + dx, pgy + dy
+                                if self.is_valid(gx, gy):
+                                    obstacle_map[gx, gy] = True
+        
+        return obstacle_map
+    
+    def plan(self, start: np.ndarray, goal: np.ndarray, obstacle_map: np.ndarray) -> Optional[Path]:
+        """A* path planning."""
+        start_gx, start_gy = self.world_to_grid(start[0], start[1])
+        goal_gx, goal_gy = self.world_to_grid(goal[0], goal[1])
+        
+        if not (self.is_valid(start_gx, start_gy) and self.is_valid(goal_gx, goal_gy)):
+            return None
+        
+        # Initialize
+        open_set = {(start_gx, start_gy)}
+        closed_set = set()
+        
+        g_score = {(start_gx, start_gy): 0}
+        f_score = {(start_gx, start_gy): self._heuristic(start_gx, start_gy, goal_gx, goal_gy)}
+        came_from = {}
+        
+        while open_set:
+            # Get node with lowest f_score
+            current = min(open_set, key=lambda n: f_score.get(n, np.inf))
+            
+            if current == (goal_gx, goal_gy):
+                # Reconstruct path
+                path_grid = [current]
+                while current in came_from:
+                    current = came_from[current]
+                    path_grid.append(current)
+                path_grid.reverse()
                 
-                # Radius increases with prediction time to account for uncertainty
-                pred_radius = cfg.robotClearanceRadius + speed * cfg.velocityScaleFactor * (j / num_predictions)
-                obstacles.append(Obstacle(pred_x, pred_y, pred_radius))
+                # Convert to world coordinates
+                path_x = []
+                path_y = []
+                for gx, gy in path_grid:
+                    wx, wy = self.grid_to_world(gx, gy)
+                    path_x.append(wx)
+                    path_y.append(wy)
                 
-    return obstacles
-
-def is_collision_free_sim(x1: float, y1: float, x2: float, y2: float, obstacles: List[Obstacle]) -> bool:
-    """Checks if the line segment (x1,y1) to (x2,y2) is free of obstacles."""
-    num_checks = 10
-    
-    for i in range(num_checks + 1):
-        t = i / num_checks
-        x = x1 + t * (x2 - x1)
-        y = y1 + t * (y2 - y1)
-        
-        for obstacle in obstacles:
-            dist = np.sqrt((x - obstacle.x)**2 + (y - obstacle.y)**2)
-            if dist < obstacle.radius:
-                return False
-    return True
-
-def extract_path_sim(tree: List[RRTNode], goal_idx: int) -> Path:
-    """Reconstructs the path from the RRT* tree."""
-    pathX, pathY = [], []
-    current_idx = goal_idx
-    
-    while current_idx != 0:
-        node = tree[current_idx - 1] # -1 because tree is 1-indexed in MATLAB, 0-indexed in Python list
-        pathX.insert(0, node.x)
-        pathY.insert(0, node.y)
-        current_idx = node.parent
-        
-    return Path(np.array(pathX), np.array(pathY))
-
-def rrt_star_planner(start_pose: np.ndarray, goal_pos: np.ndarray, obstacles: List[Obstacle], cfg: Config, map_size: np.ndarray) -> Optional[Path]:
-    """Rapidly-exploring Random Tree Star (RRT*) path planner."""
-    # MATLAB tree is 1-indexed. Python list will be 0-indexed, but parent indices will be 1-based (0 means no parent).
-    tree: List[RRTNode] = [RRTNode(start_pose[0], start_pose[1], 0, 0.0)]
-    
-    goalX, goalY = goal_pos[0], goal_pos[1]
-    xMin, xMax = 0.0, map_size[0]
-    yMin, yMax = 0.0, map_size[1]
-    
-    for _ in range(cfg.rrtMaxIter):
-        # 1. Sample point
-        if np.random.rand() < cfg.rrtGoalBias:
-            xRand, yRand = goalX, goalY
-        else:
-            xRand = xMin + np.random.rand() * (xMax - xMin)
-            yRand = yMin + np.random.rand() * (yMax - yMin)
-
-        # 2. Find Nearest
-        distances = np.array([np.sqrt((node.x - xRand)**2 + (node.y - yRand)**2) for node in tree])
-        nearestIdx_py = np.argmin(distances)
-        nearestIdx_matlab = nearestIdx_py + 1 # Convert to 1-based index
-        xNearest = tree[nearestIdx_py].x
-        yNearest = tree[nearestIdx_py].y
-
-        # 3. Steer
-        angle = np.arctan2(yRand - yNearest, xRand - xNearest)
-        xNew = xNearest + cfg.rrtStepSize * np.cos(angle)
-        yNew = yNearest + cfg.rrtStepSize * np.sin(angle)
-        
-        # Check map bounds
-        if not (xMin <= xNew <= xMax and yMin <= yNew <= yMax):
-            continue
-
-        # 4. Check Collision
-        if not is_collision_free_sim(xNearest, yNearest, xNew, yNew, obstacles):
-            continue
+                return Path(np.array(path_x), np.array(path_y))
             
-        # 5. Find Near Neighbors and Choose Best Parent
-        new_node_cost = np.inf
-        best_parent_idx_matlab = nearestIdx_matlab
-        
-        all_dists_new = np.array([np.sqrt((node.x - xNew)**2 + (node.y - yNew)**2) for node in tree])
-        nearInds_py = np.where(all_dists_new < cfg.rrtNeighborRadius)[0]
-
-        for idx_py in nearInds_py:
-            node = tree[idx_py]
-            # Cost to reach new node from this neighbor
-            dist_to_new = np.sqrt((node.x - xNew)**2 + (node.y - yNew)**2)
-            cost = node.cost + dist_to_new
+            open_set.remove(current)
+            closed_set.add(current)
             
-            if cost < new_node_cost and is_collision_free_sim(node.x, node.y, xNew, yNew, obstacles):
-                new_node_cost = cost
-                best_parent_idx_matlab = idx_py + 1
+            # Explore neighbors
+            for motion in self.motions:
+                neighbor = (current[0] + motion[0], current[1] + motion[1])
                 
-        # 6. Insert New Node
-        new_node = RRTNode(xNew, yNew, best_parent_idx_matlab, new_node_cost)
-        tree.append(new_node)
-        newIdx_py = len(tree) - 1
-        newIdx_matlab = newIdx_py + 1
+                if not self.is_valid(neighbor[0], neighbor[1]):
+                    continue
+                
+                if obstacle_map[neighbor[0], neighbor[1]]:
+                    continue
+                
+                if neighbor in closed_set:
+                    continue
+                
+                tentative_g = g_score[current] + motion[2]
+                
+                if neighbor not in open_set:
+                    open_set.add(neighbor)
+                elif tentative_g >= g_score.get(neighbor, np.inf):
+                    continue
+                
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = tentative_g + self._heuristic(neighbor[0], neighbor[1], goal_gx, goal_gy)
         
-        # 7. Rewire Neighbors
-        for idx_py in nearInds_py:
-            node = tree[idx_py]
-            # Cost to reach neighbor from new node
-            dist_from_new = np.sqrt((node.x - xNew)**2 + (node.y - yNew)**2)
-            cost = new_node_cost + dist_from_new
-            
-            if cost < node.cost and is_collision_free_sim(xNew, yNew, node.x, node.y, obstacles):
-                node.parent = newIdx_matlab
-                node.cost = cost
-        
-        # 8. Check Goal Condition
-        distToGoal = np.sqrt((xNew - goalX)**2 + (yNew - goalY)**2)
-        if distToGoal < cfg.rrtStepSize:
-            path = extract_path_sim(tree, newIdx_matlab)
-            return path
-            
-    # Final check for closest node to goal if RRT*MaxIter is reached
-    distances_to_goal = np.array([np.sqrt((node.x - goalX)**2 + (node.y - goalY)**2) for node in tree])
-    closestIdx_py = np.argmin(distances_to_goal)
-    minDist = distances_to_goal[closestIdx_py]
+        return None  # No path found
     
-    if minDist < 1.0: # Arbitrary fallback distance
-        return extract_path_sim(tree, closestIdx_py + 1)
-    else:
-        return None
+    def _heuristic(self, x1: int, y1: int, x2: int, y2: int) -> float:
+        """Euclidean distance heuristic."""
+        return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
 
-def smooth_path_sim(rough_path: Path) -> Path:
-    """
-    Path smoothing approximation (replaces Dubins path for portability). 
-    Simple straight-line connection between waypoints.
-    """
-    if len(rough_path.x) < 3:
-        return rough_path
+# === PURE PURSUIT CONTROLLER ===
 
-    # Select a few waypoints
-    num_waypoints = min(len(rough_path.x), 8)
-    indices = np.round(np.linspace(0, len(rough_path.x) - 1, num_waypoints)).astype(int)
-    wpX = rough_path.x[indices]
-    wpY = rough_path.y[indices]
-    
-    full_path_x, full_path_y = [], []
-    
-    # Simple straight-line connection between waypoints
-    for i in range(num_waypoints - 1):
-        x1, y1 = wpX[i], wpY[i]
-        x2, y2 = wpX[i+1], wpY[i+1]
-        
-        nPts = 20
-        x_seg = np.linspace(x1, x2, nPts)
-        y_seg = np.linspace(y1, y2, nPts)
-        
-        if i > 0:
-            # Skip the first point of subsequent segments to avoid duplicates
-            x_seg = x_seg[1:]
-            y_seg = y_seg[1:]
-            
-        full_path_x.extend(x_seg)
-        full_path_y.extend(y_seg)
-
-    if not full_path_x:
-        return rough_path
-        
-    return Path(np.array(full_path_x), np.array(full_path_y))
-
-def find_lookahead_sim(robotX: float, robotY: float, planned_path: Path, lookahead_distance: float) -> Tuple[float, float, int, float]:
-    """Finds the lookahead point on the path using the Pure Pursuit method."""
-    
-    # Distance from robot to every point on the path
-    all_distances = np.sqrt((planned_path.x - robotX)**2 + (planned_path.y - robotY)**2)
-    
-    # Closest point on path to robot
-    closest_index = np.argmin(all_distances)
-    cross_track_error = all_distances[closest_index]
+def find_lookahead_point(robot_x: float, robot_y: float, path: Path, lookahead_dist: float) -> Tuple[float, float, float]:
+    """Find lookahead point on path."""
+    distances = np.sqrt((path.x - robot_x)**2 + (path.y - robot_y)**2)
+    closest_idx = np.argmin(distances)
+    cross_track_error = distances[closest_idx]
     
     # Target arc length
-    sClosest = planned_path.s[closest_index]
-    sLookaheadTarget = sClosest + lookahead_distance
+    s_closest = path.s[closest_idx]
+    s_target = s_closest + lookahead_dist
     
-    # Find the point on the path that corresponds to sLookaheadTarget
-    if sLookaheadTarget >= planned_path.s[-1]:
-        # If target is beyond the end, use the last point
-        lookahead_index = len(planned_path.x) - 1
+    if s_target >= path.s[-1]:
+        return path.x[-1], path.y[-1], cross_track_error
+    
+    idx = np.searchsorted(path.s, s_target)
+    if idx >= len(path.x):
+        idx = len(path.x) - 1
+    
+    return path.x[idx], path.y[idx], cross_track_error
+
+def pure_pursuit_control(robot: RobotState, cfg: Config) -> Tuple[float, float]:
+    """Pure Pursuit controller with Dubins constraints."""
+    lookahead_x, lookahead_y, _ = find_lookahead_point(
+        robot.pose[0], robot.pose[1], robot.path, cfg.lookaheadDist
+    )
+    
+    # Calculate desired heading
+    dx = lookahead_x - robot.pose[0]
+    dy = lookahead_y - robot.pose[1]
+    desired_heading = np.arctan2(dy, dx)
+    heading_error = wrap_to_pi(desired_heading - robot.pose[2])
+    
+    # Linear velocity (forward only)
+    if np.abs(heading_error) < np.deg2rad(90):
+        lin_vel = cfg.targetLinearVel * np.cos(heading_error)
     else:
-        # Find the first index where arc length is >= target
-        lookahead_index = np.argmax(planned_path.s >= sLookaheadTarget)
-        if lookahead_index == 0 and planned_path.s[0] < sLookaheadTarget: 
-             lookahead_index = len(planned_path.x) - 1
+        lin_vel = cfg.targetLinearVel * 0.1  # Move slowly when target is behind
     
-    lookaheadX = planned_path.x[lookahead_index]
-    lookaheadY = planned_path.y[lookahead_index]
+    # Angular velocity
+    dist_to_lookahead = np.sqrt(dx**2 + dy**2)
+    if dist_to_lookahead > 1e-3:
+        ang_vel = (2 * lin_vel * np.sin(heading_error)) / dist_to_lookahead
+    else:
+        ang_vel = 0.0
     
-    return lookaheadX, lookaheadY, lookahead_index, cross_track_error
-
-# === HELPER FUNCTION TO CALCULATE BOUDING BOX CORNERS ===
-def get_bounding_box_corners(x_c: float, y_c: float, theta: float, length: float, width: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Calculates the (x, y) coordinates of the four corners of the oriented bounding box."""
-    # Half dimensions
-    half_L = width / 2.0
-    half_W = length / 2.0
+    # Apply Dubins constraints
+    if lin_vel > 0.01:
+        max_ang_vel = lin_vel / cfg.minTurnRadius
+    else:
+        max_ang_vel = cfg.maxAngVel
     
-    # Coordinates of the four corners in the robot's local frame (relative to center)
-    # The 40cm side (width) is transverse, 30cm side (length) is parallel to heading.
-    local_corners = np.array([
-        [ half_L,  half_W],  # Front-Right
-        [ half_L, -half_W],  # Front-Left
-        [-half_L, -half_W],  # Back-Left
-        [-half_L,  half_W],  # Back-Right
-        [ half_L,  half_W]   # Close the loop
-    ]).T # Transpose to get a (2, 5) array
-
-    # Rotation matrix
-    R = np.array([
-        [np.cos(theta), -np.sin(theta)],
-        [np.sin(theta),  np.cos(theta)]
-    ])
-
-    # Rotate and translate to global coordinates
-    global_corners = R @ local_corners
+    ang_vel = np.clip(ang_vel, -max_ang_vel, max_ang_vel)
+    lin_vel = np.clip(lin_vel, 0.0, cfg.maxLinVel)
     
-    corner_x = global_corners[0, :] + x_c
-    corner_y = global_corners[1, :] + y_c
+    return lin_vel, ang_vel
+
+# === LOCAL COLLISION AVOIDANCE ===
+
+def negotiate_velocity(my_robot: RobotState, all_robots: Dict[str, RobotState], my_id: str, cfg: Config, v_ideal: float) -> float:
+    """Priority-based velocity negotiation."""
+    my_pose = my_robot.pose
+    my_dist_to_goal = np.sqrt((my_pose[0] - my_robot.goal[0])**2 + (my_pose[1] - my_robot.goal[1])**2)
     
-    return corner_x, corner_y
+    v_cmd = v_ideal
+    
+    for rid, other_robot in all_robots.items():
+        if rid == my_id or other_robot.reached:
+            continue
+        
+        other_pose = other_robot.pose
+        
+        # Current distance
+        curr_dist = np.sqrt((my_pose[0] - other_pose[0])**2 + (my_pose[1] - other_pose[1])**2)
+        
+        # Emergency stop
+        if curr_dist < cfg.emergencyDistance:
+            return 0.0
+        
+        # Check for box collision at current positions
+        if check_box_collision(my_pose, other_pose, cfg):
+            return 0.0
+        
+        # Predict future positions
+        T = cfg.coordinationHorizon
+        my_pred_x = my_pose[0] + v_ideal * np.cos(my_pose[2]) * T
+        my_pred_y = my_pose[1] + v_ideal * np.sin(my_pose[2]) * T
+        my_pred_pose = np.array([my_pred_x, my_pred_y, my_pose[2]])
+        
+        other_vx, other_vy = other_robot.velocity
+        other_pred_x = other_pose[0] + other_vx * T
+        other_pred_y = other_pose[1] + other_vy * T
+        other_pred_pose = np.array([other_pred_x, other_pred_y, other_pose[2]])
+        
+        # Check predicted collision
+        pred_dist = np.sqrt((my_pred_x - other_pred_x)**2 + (my_pred_y - other_pred_y)**2)
+        
+        if pred_dist < cfg.safeSeparation or check_box_collision(my_pred_pose, other_pred_pose, cfg):
+            # Priority based on distance to goal
+            other_dist_to_goal = np.sqrt((other_pose[0] - other_robot.goal[0])**2 + (other_pose[1] - other_robot.goal[1])**2)
+            
+            if my_dist_to_goal > other_dist_to_goal:
+                # Other robot has priority
+                v_cmd = min(v_cmd, v_ideal * 0.3)
+    
+    return max(0.0, v_cmd)
 
-
-# === MAIN SIMULATOR FUNCTION ===
+# === MAIN SIMULATOR ===
 
 def multi_robot_simulator():
-    """Simulates 12 robots using dynamic path planning."""
-    
-    np.random.seed(42)  # Set random seed for reproducibility
+    """Main simulation loop."""
+    np.random.seed(42)
     
     SIM = SimParams()
     CFG = Config()
     
-    static_obstacles: List[Any] = []  # Empty for open space navigation
-
-    # --- INITIALIZE ROBOTS (No Change) ---
-    # Calculate required separation based on new bounding box
-    min_separation = 2 * CFG.robotClearanceRadius + 0.1 # Minimum center-to-center distance + buffer
+    print(f'Configuration:')
+    print(f'  Min Turn Radius: {CFG.minTurnRadius:.3f}m')
+    print(f'  Robot Size: {CFG.robotLength:.2f}m x {CFG.robotWidth:.2f}m')
+    print(f'  Clearance Radius: {CFG.robotClearanceRadius:.3f}m')
+    print(f'  Grid Resolution: {CFG.gridResolution:.3f}m')
     
-    print(f'Initializing {SIM.numRobots} robots in open space (min separation: {min_separation:.2f}m)...')
+    # Initialize A* planner
+    planner = AStarPlanner(SIM.mapSize, CFG.gridResolution, CFG)
+    
+    # Initialize robots
+    print(f'\nInitializing {SIM.numRobots} robots...')
     robots: Dict[str, RobotState] = {}
-    edgeMargin = 0.5
+    min_separation = 2 * CFG.robotClearanceRadius + 0.2
+    edge_margin = 0.5
     
     for i in range(1, SIM.numRobots + 1):
-        robotId = f'robot{i:02d}'
+        robot_id = f'robot{i:02d}'
         
-        # Generate random start position (with minimum separation)
-        valid_start = False
-        attempts = 0
-        x, y = 0.0, 0.0
-        while not valid_start and attempts < 100:
-            x = edgeMargin + np.random.rand() * (SIM.mapSize[0] - 2 * edgeMargin)
-            y = edgeMargin + np.random.rand() * (SIM.mapSize[1] - 2 * edgeMargin)
+        # Find valid start
+        for _ in range(100):
+            x = edge_margin + np.random.rand() * (SIM.mapSize[0] - 2 * edge_margin)
+            y = edge_margin + np.random.rand() * (SIM.mapSize[1] - 2 * edge_margin)
             
-            valid_start = True
+            valid = True
             for robot in robots.values():
-                dist = np.sqrt((x - robot.pose[0])**2 + (y - robot.pose[1])**2)
-                if dist < min_separation:
-                    valid_start = False
+                if np.sqrt((x - robot.pose[0])**2 + (y - robot.pose[1])**2) < min_separation:
+                    valid = False
                     break
-            attempts += 1
+            if valid:
+                break
+        
+        # Find valid goal
+        for _ in range(100):
+            gx = edge_margin + np.random.rand() * (SIM.mapSize[0] - 2 * edge_margin)
+            gy = edge_margin + np.random.rand() * (SIM.mapSize[1] - 2 * edge_margin)
             
-        # Generate random goal position (far from start)
-        valid_goal = False
-        attempts = 0
-        gx, gy = 0.0, 0.0
-        while not valid_goal and attempts < 100:
-            gx = edgeMargin + np.random.rand() * (SIM.mapSize[0] - 2 * edgeMargin)
-            gy = edgeMargin + np.random.rand() * (SIM.mapSize[1] - 2 * edgeMargin)
-            
-            dist_from_start = np.sqrt((gx - x)**2 + (gy - y)**2)
-            if dist_from_start > 2.0:
-                valid_goal = True
-            attempts += 1
-            
-        # Initialize robot state
+            if np.sqrt((gx - x)**2 + (gy - y)**2) > 2.0:
+                break
+        
         theta = np.random.rand() * 2 * np.pi
         initial_pose = np.array([x, y, theta])
         goal_pos = np.array([gx, gy])
         
         # Initial straight-line path
-        nPts = 20
-        path_x = np.linspace(x, gx, nPts)
-        path_y = np.linspace(y, gy, nPts)
+        path_x = np.linspace(x, gx, 20)
+        path_y = np.linspace(y, gy, 20)
         initial_path = Path(path_x, path_y)
         
-        robots[robotId] = RobotState(initial_pose, goal_pos, initial_path, CFG)
-        
-        print(f'  {robotId}: Start({x:.2f}, {y:.2f}) -> Goal({gx:.2f}, {gy:.2f})')
-
-    # --- VISUALIZATION SETUP (Matplotlib) ---
+        robots[robot_id] = RobotState(initial_pose, goal_pos, initial_path)
+        print(f'  {robot_id}: Start({x:.2f}, {y:.2f}) -> Goal({gx:.2f}, {gy:.2f})')
+    
+    # Visualization setup
     if SIM.realTimeMode:
-        plt.ion() # Turn on interactive mode
-        
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.set_title('Multi-Robot Simulation - Real-Time Path Planning (Open Space)')
-    ax.set_xlabel('X Position [m]')
-    ax.set_ylabel('Y Position [m]')
+        plt.ion()
+    
+    fig, ax = plt.subplots(figsize=(11, 9))
     ax.set_xlim([-0.5, SIM.mapSize[0]])
     ax.set_ylim([-0.5, SIM.mapSize[1]])
-    ax.set_aspect('equal', adjustable='box')
-    ax.grid(True)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
     
-    # Suppress the MatplotlibDeprecationWarning
-    try:
-        colors = plt.cm.get_cmap('hsv', SIM.numRobots)
-    except Exception:
-        colors = plt.get_cmap('hsv', SIM.numRobots)
-
-    plot_handles: Dict[str, Dict[str, Any]] = {}
-    robotIds = list(robots.keys())
+    colors = plt.cm.get_cmap('hsv', SIM.numRobots)
+    plot_handles = {}
     
-    for i, rid in enumerate(robotIds):
-        robot = robots[rid]
+    for i, (rid, robot) in enumerate(robots.items()):
         col = colors(i)
-        
-        plot_handles[rid] = {}
-        
-        # Goal marker (X)
-        ax.plot(robot.goal[0], robot.goal[1], marker='x', color=col, markersize=15, linewidth=2)
-        # Start marker (*)
-        ax.plot(robot.pose[0], robot.pose[1], marker='*', color=col, markersize=10, linewidth=1.5)
-        
-        # Path line (dashed, transparent)
-        plot_handles[rid]['path'], = ax.plot(robot.path.x, robot.path.y, '--', color=col, linewidth=1.0, alpha=0.3)
-        # Trajectory line (dotted)
-        plot_handles[rid]['traj'], = ax.plot([], [], ':', color=col, linewidth=2.0)
-        # Robot position (circle)
-        plot_handles[rid]['robot'], = ax.plot([], [], 'o', color=col, markersize=12, markerfacecolor=col)
-        # Heading indicator (line)
-        plot_handles[rid]['heading'], = ax.plot([], [], '-', color=col, linewidth=2.5)
-        
-        # NEW: Robot Bounding Box (rectangle)
-        plot_handles[rid]['boundingBox'], = ax.plot([], [], '-', color=col, linewidth=1.5, alpha=0.7)
-        
-        # Safety radius circle
-        plot_handles[rid]['safetyCircle'], = ax.plot([], [], ':', color=col, linewidth=1, alpha=0.2)
-        
-    title_handle = ax.set_title(f'Multi-Robot Simulation | t=0.0s | Robots: 0/{SIM.numRobots} reached goal')
-
-    # --- SIMULATION LOOP ---
-    print(f'\nStarting {"REAL-TIME" if SIM.realTimeMode else "FAST"} simulation...\n')
+        plot_handles[rid] = {
+            'goal': ax.plot(robot.goal[0], robot.goal[1], 'x', color=col, markersize=12, markeredgewidth=3)[0],
+            'path': ax.plot([], [], '--', color=col, linewidth=1, alpha=0.4)[0],
+            'traj': ax.plot([], [], '-', color=col, linewidth=1.5, alpha=0.7)[0],
+            'robot': ax.plot([], [], 'o', color=col, markersize=10)[0],
+            'heading': ax.plot([], [], '-', color=col, linewidth=2)[0],
+            'box': ax.plot([], [], '-', color=col, linewidth=1.5)[0]
+        }
     
-    simTime = 0.0
-    frameCount = 0
+    title = ax.set_title('Multi-Robot Simulation (A* + Dubins)')
     
-    while simTime < SIM.maxTime:
-        frame_start_time = time.time()
+    # Simulation loop
+    print(f'\nStarting simulation...\n')
+    sim_time = 0.0
+    frame_count = 0
+    
+    while sim_time < SIM.maxTime:
+        frame_start = time.time()
         
-        # 1. Update all Kalman filters with current measurements (No Change)
+        # Update velocities for all robots
+        for robot in robots.values():
+            if not robot.reached:
+                robot.velocity = np.array([
+                    CFG.targetLinearVel * np.cos(robot.pose[2]),
+                    CFG.targetLinearVel * np.sin(robot.pose[2])
+                ])
+        
+        # Control each robot
+        num_reached = sum(1 for r in robots.values() if r.reached)
+        
         for rid, robot in robots.items():
             if robot.reached:
                 continue
             
-            # Kalman prediction
-            F = np.array([
-                [1, 0, SIM.dt, 0],
-                [0, 1, 0, SIM.dt],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1]
-            ])
-            robot.kf_state = F @ robot.kf_state
-            robot.kf_P = F @ robot.kf_P @ F.T + robot.kf_Q
-            
-            # Kalman update
-            H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])
-            z = robot.pose[:2]
-            y_inn = z - H @ robot.kf_state
-            S = H @ robot.kf_P @ H.T + robot.kf_R
-            K = robot.kf_P @ H.T @ np.linalg.inv(S)
-            robot.kf_state = robot.kf_state + K @ y_inn
-            robot.kf_P = (np.eye(4) - K @ H) @ robot.kf_P
-            
-            # Update velocity estimate
-            robot.velocity = robot.kf_state[2:]
-
-        # 2. Control and update each robot (No Change)
-        numReached = 0
-        for rid, robot in robots.items():
-            if robot.reached:
-                numReached += 1
-                continue
-            
-            # Check if goal reached
-            distToGoal = np.sqrt((robot.pose[0] - robot.goal[0])**2 + (robot.pose[1] - robot.goal[1])**2)
-            if distToGoal < CFG.posTolerance:
+            # Check goal
+            dist_to_goal = np.sqrt((robot.pose[0] - robot.goal[0])**2 + (robot.pose[1] - robot.goal[1])**2)
+            if dist_to_goal < CFG.posTolerance:
                 robot.reached = True
-                robot.reachedTime = simTime
-                numReached += 1
-                print(f'  [{simTime:.1f}s] {rid} reached goal (replans: {robot.replanCount})')
+                robot.reachedTime = sim_time
+                print(f'  [{sim_time:.1f}s] {rid} reached goal ({robot.replanCount} replans)')
                 continue
-
-            # Path replanning
-            if (simTime - robot.lastReplanTime) >= CFG.replanInterval:
-                other_robots_list = create_other_robots_list(robots, rid)
-                obstacles = create_dynamic_obstacles_sim(other_robots_list, CFG)
+            
+            # Check if stuck
+            pos_change = np.linalg.norm(robot.pose[:2] - robot.lastPosition)
+            if pos_change < 0.01:
+                robot.stuckCounter += 1
+            else:
+                robot.stuckCounter = 0
+            robot.lastPosition = robot.pose[:2].copy()
+            
+            # Replan if needed
+            should_replan = (
+                (sim_time - robot.lastReplanTime) >= CFG.replanInterval or
+                robot.stuckCounter > 15
+            )
+            
+            if should_replan:
+                # Create obstacle map from other robots
+                other_robots_list = []
+                for other_id, other_robot in robots.items():
+                    if other_id != rid and not other_robot.reached:
+                        other_robots_list.append({
+                            'x': other_robot.pose[0],
+                            'y': other_robot.pose[1],
+                            'vx': other_robot.velocity[0],
+                            'vy': other_robot.velocity[1]
+                        })
                 
-                newPath = rrt_star_planner(robot.pose, robot.goal, obstacles, CFG, SIM.mapSize)
+                obstacle_map = planner.create_obstacle_map(other_robots_list)
+                new_path = planner.plan(robot.pose, robot.goal, obstacle_map)
                 
-                if newPath is not None:
-                    robot.path = smooth_path_sim(newPath)
+                if new_path is not None:
+                    robot.path = new_path
                     robot.replanCount += 1
-                    
-                    # Update path visualization
+                    robot.stuckCounter = 0
                     plot_handles[rid]['path'].set_data(robot.path.x, robot.path.y)
                 
-                robot.lastReplanTime = simTime
-
-            # Pure Pursuit Control
-            lookaheadX, lookaheadY, _, crossTrackError = \
-                find_lookahead_sim(robot.pose[0], robot.pose[1], robot.path, CFG.lookaheadDist)
+                robot.lastReplanTime = sim_time
             
-            # Update error history
-            robot.errorHistory.append(crossTrackError)
-            if len(robot.errorHistory) > 30:
-                robot.errorHistory.pop(0)
-
-            # Recovery mode (simplified logic)
-            linVel, angVel = 0.0, 0.0
-            if robot.recoveryTimer is not None:
-                recoveryElapsed = simTime - robot.recoveryTimer
-                if recoveryElapsed < CFG.recoveryDuration:
-                    linVel = 0.0
-                    angVel = np.deg2rad(30) # Spin slowly
-                else:
-                    robot.recoveryTimer = None
+            # Pure pursuit control
+            lin_vel, ang_vel = pure_pursuit_control(robot, CFG)
             
-            if robot.recoveryTimer is None:
-                # Normal Pure Pursuit control
-                dx = lookaheadX - robot.pose[0]
-                dy = lookaheadY - robot.pose[1]
-                desiredHeading = np.arctan2(dy, dx)
-                headingError = wrap_to_pi(desiredHeading - robot.pose[2])
-                distToLookahead = np.sqrt(dx**2 + dy**2)
-                
-                # Formula for angular velocity (based on curvature)
-                if distToLookahead > 1e-6:
-                    angVel = (2 * CFG.targetLinearVel * np.sin(headingError)) / distToLookahead
-                else:
-                    angVel = 0.0
-
-                if np.abs(headingError) < np.deg2rad(90):
-                    linVel = CFG.targetLinearVel * np.cos(headingError)
-                else:
-                    linVel = CFG.targetLinearVel * 0.3 # Slow forward
-
-            # Apply velocity limits
-            linVel = max(0.0, min(linVel, CFG.maxLinVel))
-            angVel = max(-CFG.maxAngVel, min(angVel, CFG.maxAngVel))
+            # Collision avoidance
+            lin_vel = negotiate_velocity(robot, robots, rid, CFG, lin_vel)
             
-            # Update robot state (simple kinematic model)
-            robot.pose[0] += linVel * np.cos(robot.pose[2]) * SIM.dt
-            robot.pose[1] += linVel * np.sin(robot.pose[2]) * SIM.dt
-            robot.pose[2] = wrap_to_pi(robot.pose[2] + angVel * SIM.dt)
+            # Update state
+            robot.pose[0] += lin_vel * np.cos(robot.pose[2]) * SIM.dt
+            robot.pose[1] += lin_vel * np.sin(robot.pose[2]) * SIM.dt
+            robot.pose[2] = wrap_to_pi(robot.pose[2] + ang_vel * SIM.dt)
             
-            # Update trajectory
             robot.trajectory.append(robot.pose[:2].copy())
-            
-        # 3. Update visualization
-        if SIM.realTimeMode or frameCount % 5 == 0:
+        
+        # Update visualization
+        if frame_count % 2 == 0 or not SIM.realTimeMode:
             for rid, robot in robots.items():
-                
-                # Hide visuals if reached
                 if robot.reached:
                     plot_handles[rid]['robot'].set_data([], [])
                     plot_handles[rid]['heading'].set_data([], [])
-                    plot_handles[rid]['safetyCircle'].set_data([], [])
-                    plot_handles[rid]['boundingBox'].set_data([], [])
+                    plot_handles[rid]['box'].set_data([], [])
                     continue
                 
-                # Update robot position (circle)
+                # Robot position
                 plot_handles[rid]['robot'].set_data([robot.pose[0]], [robot.pose[1]])
                 
-                # Update heading indicator
-                headingLen = 0.25
-                hx = [robot.pose[0], robot.pose[0] + headingLen * np.cos(robot.pose[2])]
-                hy = [robot.pose[1], robot.pose[1] + headingLen * np.sin(robot.pose[2])]
+                # Heading arrow
+                arrow_len = 0.25
+                hx = [robot.pose[0], robot.pose[0] + arrow_len * np.cos(robot.pose[2])]
+                hy = [robot.pose[1], robot.pose[1] + arrow_len * np.sin(robot.pose[2])]
                 plot_handles[rid]['heading'].set_data(hx, hy)
                 
-                # Update trajectory
-                traj_array = np.array(robot.trajectory)
-                plot_handles[rid]['traj'].set_data(traj_array[:, 0], traj_array[:, 1])
+                # Bounding box
+                hl, hw = CFG.robotLength / 2, CFG.robotWidth / 2
+                corners = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw], [hl, hw]])
+                cos_t, sin_t = np.cos(robot.pose[2]), np.sin(robot.pose[2])
+                R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+                rotated = (R @ corners.T).T + robot.pose[:2]
+                plot_handles[rid]['box'].set_data(rotated[:, 0], rotated[:, 1])
                 
-                # NEW: Update Bounding Box
-                boxX, boxY = get_bounding_box_corners(
-                    robot.pose[0], 
-                    robot.pose[1], 
-                    robot.pose[2], 
-                    CFG.robotLength, # 30 cm side (parallel to heading)
-                    CFG.robotWidth   # 40 cm side (transverse)
-                )
-                plot_handles[rid]['boundingBox'].set_data(boxX, boxY)
-                
-                # Update safety circle using the new clearance radius
-                theta_circle = np.linspace(0, 2 * np.pi, 30)
-                circleX = robot.pose[0] + CFG.robotClearanceRadius * np.cos(theta_circle)
-                circleY = robot.pose[1] + CFG.robotClearanceRadius * np.sin(theta_circle)
-                plot_handles[rid]['safetyCircle'].set_data(circleX, circleY)
-
-            title_handle.set_text(f'Multi-Robot Simulation | t={simTime:.1f}s | Robots: {numReached}/{SIM.numRobots} reached goal')
+                # Trajectory
+                traj = np.array(robot.trajectory)
+                plot_handles[rid]['traj'].set_data(traj[:, 0], traj[:, 1])
+            
+            title.set_text(f'Multi-Robot Simulation | t={sim_time:.1f}s | Reached: {num_reached}/{SIM.numRobots}')
+            
             fig.canvas.draw()
             fig.canvas.flush_events()
-
-        # 4. Check termination condition (No Change)
-        if numReached == SIM.numRobots:
+        
+        # Check termination
+        if num_reached == SIM.numRobots:
             print('\n✓ All robots reached their goals!')
             break
-            
-        # 5. Advance time and maintain real-time rate (No Change)
-        simTime += SIM.dt
-        frameCount += 1
         
+        # Advance time
+        sim_time += SIM.dt
+        frame_count += 1
+        
+        # Real-time pacing
         if SIM.realTimeMode:
-            elapsed = time.time() - frame_start_time
+            elapsed = time.time() - frame_start
             if elapsed < SIM.dt:
                 time.sleep(SIM.dt - elapsed)
-            
-    # --- SIMULATION RESULTS (No Change) ---
-    print('\n=== Simulation Complete ===')
-    print(f'Total time: {simTime:.1f} seconds')
     
+    # Results
+    print('\n=== Simulation Complete ===')
+    print(f'Total time: {sim_time:.1f} seconds')
     for rid, robot in robots.items():
         if robot.reached:
-            print(f'  {rid}: Reached in {robot.reachedTime:.1f}s ({robot.replanCount} replans)')
+            print(f'  {rid}: Reached in {robot.reachedTime:.1f}s ({robot.replanCount} replans)')
         else:
-            print(f'  {rid}: Did not reach goal')
-            
-    print('\nSimulation finished.')
+            print(f'  {rid}: Did not reach goal')
     
-    # Keep the plot window open after the simulation finishes
     if SIM.realTimeMode:
         plt.ioff()
     plt.show()
