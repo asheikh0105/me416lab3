@@ -14,26 +14,47 @@ class Config:
     targetLinearVel: float = 0.3
     maxLinVel: float = 0.3
     maxAngVel: float = np.deg2rad(90)
+    reverseVel: float = 0.15  # Reverse speed when backing up
+    minVelForTurning: float = 0.05  # Minimum velocity required to turn (car-like constraint)
     
     # Robot Dimensions (car-like)
     robotLength: float = 0.40  # Wheelbase
     robotWidth: float = 0.30
     safetyBuffer: float = 0.15
+    collisionBuffer: float = 0.12  # Additional buffer for collision prevention
+    hardCollisionRadius: float = 0.25  # Hard boundary circle from center (NEVER intersect)
     
     # Dubins Parameters
     maxSteeringAngle: float = np.deg2rad(35)
     
     # Path planning - SWITCHED TO A* for speed
-    replanInterval: float = 0.5  # More frequent replanning
+    replanInterval: float = 0.6  # Replanning interval
     gridResolution: float = 0.15  # Grid cell size for A*
     
     # Dynamic obstacle parameters
-    predictionHorizon: float = 2.0
+    predictionHorizon: float = 2.5
     
-    # Local Collision Avoidance
-    coordinationHorizon: float = 1.5
-    stopDistance: float = 0.6
-    emergencyDistance: float = 0.4
+    # Local Collision Avoidance - ENHANCED
+    coordinationHorizon: float = 2.0
+    safetyDistance: float = 0.55  # Minimum safe distance between robot centers
+    emergencyDistance: float = 0.52  # Emergency stop distance
+    decisionDistance: float = 0.8  # Distance at which to make reverse decisions
+    
+    # Cost-based reversing parameters
+    reverseCostPerMeter: float = 2.0  # Cost multiplier for reversing (vs forward motion)
+    waitCostPerSecond: float = 0.5  # Cost of waiting in place per second
+    progressBenefit: float = 1.0  # Benefit of making progress toward goal
+    reverseMinBenefit: float = 1.5  # Minimum cost savings to justify reversing
+    commitmentTime: float = 2.0  # Once reversing, commit for this time (prevents oscillation)
+    maxReverseDistance: float = 0.5  # Maximum distance to reverse
+    
+    # Map boundaries
+    mapBoundaryMargin: float = 0.3  # Don't reverse if within this margin of boundary
+    
+    # Traffic jam detection and resolution
+    stuckThreshold: int = 90  # Frames before considering stuck (3 seconds at 30Hz)
+    trafficJamTimeout: float = 10.0  # Max time to wait before declaring traffic jam
+    deadlockResetTime: float = 15.0  # Reset all robots' reverse decisions if stuck this long
     
     # Tolerances
     posTolerance: float = 0.25
@@ -42,9 +63,9 @@ class Config:
     def __post_init__(self):
         """Calculate derived parameters."""
         self.minTurnRadius = self.robotLength / np.tan(self.maxSteeringAngle)
-        # Clearance radius: diagonal of box + safety buffer
+        # Clearance radius: diagonal of box + safety buffer + collision buffer
         R_diag = np.sqrt(self.robotWidth**2 + self.robotLength**2) / 2.0
-        self.robotClearanceRadius = R_diag + self.safetyBuffer
+        self.robotClearanceRadius = R_diag + self.safetyBuffer + self.collisionBuffer
         self.safeSeparation = 2 * self.robotClearanceRadius
 
 class SimParams:
@@ -84,6 +105,18 @@ class RobotState:
         self.path = initial_path
         self.stuckCounter = 0
         self.lastPosition = initial_pose[:2].copy()
+        
+        # Cost-based reversing state
+        self.reverseDecision = None  # 'forward', 'reverse', or 'wait'
+        self.decisionTime = -np.inf  # When was the decision made
+        self.reverseTargetDistance = 0.0  # How far to reverse
+        self.reverseStartPos = initial_pose[:2].copy()
+        
+        # Traffic jam detection
+        self.waitingTime = 0.0
+        self.lastWaitPosition = initial_pose[:2].copy()
+        self.inTrafficJam = False
+        self.totalWaitTime = 0.0  # Total time spent waiting
 
 # === HELPER FUNCTIONS ===
 
@@ -210,16 +243,18 @@ class AStarPlanner:
         inflation_cells = int(np.ceil(self.cfg.robotClearanceRadius / self.resolution))
         
         for robot in other_robots:
-            # Current position
+            # Current position - use hard collision radius for obstacles
             cx, cy = self.world_to_grid(robot['x'], robot['y'])
             if self.is_valid(cx, cy):
-                for dx in range(-inflation_cells, inflation_cells + 1):
-                    for dy in range(-inflation_cells, inflation_cells + 1):
+                # Use the hard collision radius as the minimum
+                hard_inflation = int(np.ceil(self.cfg.hardCollisionRadius / self.resolution))
+                for dx in range(-hard_inflation, hard_inflation + 1):
+                    for dy in range(-hard_inflation, hard_inflation + 1):
                         gx, gy = cx + dx, cy + dy
                         if self.is_valid(gx, gy):
                             wx, wy = self.grid_to_world(gx, gy)
                             dist = np.sqrt((wx - robot['x'])**2 + (wy - robot['y'])**2)
-                            if dist < self.cfg.robotClearanceRadius:
+                            if dist < self.cfg.hardCollisionRadius:
                                 obstacle_map[gx, gy] = True
             
             # Predicted positions
@@ -339,7 +374,7 @@ def find_lookahead_point(robot_x: float, robot_y: float, path: Path, lookahead_d
     return path.x[idx], path.y[idx], cross_track_error
 
 def pure_pursuit_control(robot: RobotState, cfg: Config) -> Tuple[float, float]:
-    """Pure Pursuit controller with Dubins constraints."""
+    """Pure Pursuit controller with Dubins constraints - car-like behavior."""
     lookahead_x, lookahead_y, _ = find_lookahead_point(
         robot.pose[0], robot.pose[1], robot.path, cfg.lookaheadDist
     )
@@ -350,24 +385,34 @@ def pure_pursuit_control(robot: RobotState, cfg: Config) -> Tuple[float, float]:
     desired_heading = np.arctan2(dy, dx)
     heading_error = wrap_to_pi(desired_heading - robot.pose[2])
     
-    # Linear velocity (forward only)
-    if np.abs(heading_error) < np.deg2rad(90):
-        lin_vel = cfg.targetLinearVel * np.cos(heading_error)
-    else:
-        lin_vel = cfg.targetLinearVel * 0.1  # Move slowly when target is behind
+    # Check if target is ahead or behind
+    is_forward = np.abs(heading_error) < np.deg2rad(90)
     
-    # Angular velocity
+    # Linear velocity (always positive for forward, will be negated for reverse in main loop)
+    if is_forward:
+        # Target is ahead - normal forward motion
+        lin_vel = cfg.targetLinearVel * max(0.3, np.cos(heading_error))
+    else:
+        # Target is behind - need to turn around
+        # For car-like robots, we must creep forward while turning sharply
+        lin_vel = cfg.targetLinearVel * 0.2  # Slow creep to enable turning
+    
+    # Angular velocity (only allowed when moving)
     dist_to_lookahead = np.sqrt(dx**2 + dy**2)
-    if dist_to_lookahead > 1e-3:
+    if dist_to_lookahead > 1e-3 and lin_vel > cfg.minVelForTurning:
+        # Standard pure pursuit curvature
         ang_vel = (2 * lin_vel * np.sin(heading_error)) / dist_to_lookahead
     else:
+        # Not moving fast enough to turn (car-like constraint)
         ang_vel = 0.0
     
     # Apply Dubins constraints
-    if lin_vel > 0.01:
+    if lin_vel > cfg.minVelForTurning:
         max_ang_vel = lin_vel / cfg.minTurnRadius
     else:
-        max_ang_vel = cfg.maxAngVel
+        # If barely moving, can't turn at all
+        max_ang_vel = 0.0
+        ang_vel = 0.0
     
     ang_vel = np.clip(ang_vel, -max_ang_vel, max_ang_vel)
     lin_vel = np.clip(lin_vel, 0.0, cfg.maxLinVel)
@@ -376,53 +421,325 @@ def pure_pursuit_control(robot: RobotState, cfg: Config) -> Tuple[float, float]:
 
 # === LOCAL COLLISION AVOIDANCE ===
 
-def negotiate_velocity(my_robot: RobotState, all_robots: Dict[str, RobotState], my_id: str, cfg: Config, v_ideal: float) -> float:
-    """Priority-based velocity negotiation."""
+def check_circle_collision(pos1: np.ndarray, pos2: np.ndarray, radius1: float, radius2: float) -> bool:
+    """Check if two circles collide."""
+    dist = np.sqrt((pos2[0] - pos1[0])**2 + (pos2[1] - pos1[1])**2)
+    return dist < (radius1 + radius2)
+
+def check_any_collision(pose1: np.ndarray, pose2: np.ndarray, cfg: Config) -> bool:
+    """
+    Check if two robots collide using BOTH circle and box collision.
+    Returns True if EITHER the hard collision circles OR the bounding boxes intersect.
+    """
+    # Check hard collision circles first (fastest check)
+    if check_circle_collision(pose1[:2], pose2[:2], cfg.hardCollisionRadius, cfg.hardCollisionRadius):
+        return True
+    
+    # Check bounding box collision
+    return check_box_collision(pose1, pose2, cfg)
+
+def is_near_boundary(pose: np.ndarray, map_size: np.ndarray, margin: float) -> bool:
+    """Check if robot is near map boundary."""
+    x, y = pose[0], pose[1]
+    return (x < margin or x > map_size[0] - margin or 
+            y < margin or y > map_size[1] - margin)
+
+def is_reverse_path_clear(my_pose: np.ndarray, all_robots: Dict[str, RobotState], my_id: str, cfg: Config, map_size: np.ndarray, reverse_dist: float = 0.4) -> bool:
+    """
+    Check if the path behind the robot is clear for reversing.
+    Samples points along the reverse trajectory and checks map boundaries.
+    """
+    # Calculate reverse direction (opposite of current heading)
+    reverse_heading = my_pose[2] + np.pi
+    
+    # Check multiple points along reverse path
+    num_checks = 8
+    for i in range(1, num_checks + 1):
+        t = (i / num_checks) * reverse_dist
+        check_x = my_pose[0] + t * np.cos(reverse_heading)
+        check_y = my_pose[1] + t * np.sin(reverse_heading)
+        check_pose = np.array([check_x, check_y, my_pose[2]])
+        
+        # Check if we'd go out of bounds
+        if check_x < cfg.mapBoundaryMargin or check_x > map_size[0] - cfg.mapBoundaryMargin:
+            return False
+        if check_y < cfg.mapBoundaryMargin or check_y > map_size[1] - cfg.mapBoundaryMargin:
+            return False
+        
+        # Check against all other robots (including parked)
+        for rid, other_robot in all_robots.items():
+            if rid == my_id:
+                continue
+            
+            # Check collision with this point
+            if check_any_collision(check_pose, other_robot.pose, cfg):
+                return False
+            
+            # Also check center distance
+            dist = np.sqrt((check_x - other_robot.pose[0])**2 + (check_y - other_robot.pose[1])**2)
+            if dist < cfg.safetyDistance:
+                return False
+    
+    return True
+
+def check_trajectory_collision(my_pose: np.ndarray, my_vel: float, other_pose: np.ndarray, other_vel: np.ndarray, cfg: Config, time_horizon: float = 2.0, num_checks: int = 10) -> bool:
+    """
+    Check if the trajectory of two robots will intersect within time_horizon.
+    Returns True if collision is predicted.
+    """
+    for i in range(1, num_checks + 1):
+        t = (i / num_checks) * time_horizon
+        
+        # Predict my position
+        my_future_x = my_pose[0] + my_vel * np.cos(my_pose[2]) * t
+        my_future_y = my_pose[1] + my_vel * np.sin(my_pose[2]) * t
+        my_future_pose = np.array([my_future_x, my_future_y, my_pose[2]])
+        
+        # Predict other position
+        other_future_x = other_pose[0] + other_vel[0] * t
+        other_future_y = other_pose[1] + other_vel[1] * t
+        other_future_pose = np.array([other_future_x, other_future_y, other_pose[2]])
+        
+        # Check collision at this time step - use comprehensive check
+        if check_any_collision(my_future_pose, other_future_pose, cfg):
+            return True
+        
+        # Also check center-to-center distance
+        dist = np.sqrt((my_future_x - other_future_x)**2 + (my_future_y - other_future_y)**2)
+        if dist < cfg.safetyDistance:
+            return True
+    
+    return False
+
+def detect_traffic_jam(robots: Dict[str, RobotState], cfg: Config, sim_time: float) -> List[str]:
+    """
+    Detect which robots are in a traffic jam and check for global deadlock.
+    Returns list of robot IDs that should be given priority to clear the jam.
+    """
+    jammed_robots = []
+    all_waiting = True
+    
+    for rid, robot in robots.items():
+        if robot.reached:
+            continue
+        
+        # Check if making progress
+        if robot.waitingTime < cfg.stuckThreshold * 0.033:  # Convert frames to seconds
+            all_waiting = False
+        
+        # Check if robot has been waiting/stuck for too long
+        if robot.waitingTime > cfg.trafficJamTimeout:
+            jammed_robots.append((rid, robot))
+    
+    if not jammed_robots:
+        return []
+    
+    # Check for global deadlock - all robots waiting for a long time
+    if all_waiting and sim_time > cfg.deadlockResetTime:
+        # Global deadlock detected - reset all robots' decisions
+        for robot in robots.values():
+            if not robot.reached:
+                robot.reverseDecision = None
+                robot.decisionTime = -np.inf
+                robot.waitingTime = 0.0
+        print(f'  [{sim_time:.1f}s] Global deadlock detected - resetting all decisions')
+        return []
+    
+    # Sort by total wait time and distance to goal
+    jammed_robots.sort(key=lambda x: (
+        -x[1].totalWaitTime,  # More wait time = higher priority (negative for descending)
+        np.sqrt((x[1].pose[0] - x[1].goal[0])**2 + (x[1].pose[1] - x[1].goal[1])**2)
+    ))
+    
+    # Return top 2 robots that deserve priority
+    return [jammed_robots[i][0] for i in range(min(2, len(jammed_robots)))]
+
+def calculate_reverse_cost_benefit(my_robot: RobotState, other_robot: RobotState, my_id: str, cfg: Config, all_robots: Dict[str, RobotState], map_size: np.ndarray) -> Tuple[float, float]:
+    """
+    Calculate the cost-benefit of reversing vs waiting.
+    Returns: (reverse_cost, wait_cost) - lower is better
+    """
+    my_pose = my_robot.pose
+    my_dist_to_goal = np.sqrt((my_pose[0] - my_robot.goal[0])**2 + (my_pose[1] - my_robot.goal[1])**2)
+    other_dist_to_goal = np.sqrt((other_robot.pose[0] - other_robot.goal[0])**2 + 
+                                  (other_robot.pose[1] - other_robot.goal[1])**2)
+    
+    # Estimate how far I'd need to reverse to clear the path
+    curr_dist = np.sqrt((my_pose[0] - other_robot.pose[0])**2 + (my_pose[1] - other_robot.pose[1])**2)
+    estimated_reverse_dist = max(0.3, cfg.safetyDistance - curr_dist + 0.2)  # Add margin
+    estimated_reverse_dist = min(estimated_reverse_dist, cfg.maxReverseDistance)
+    
+    # Check if reverse path is clear for this distance
+    if not is_reverse_path_clear(my_pose, all_robots, my_id, cfg, map_size, estimated_reverse_dist):
+        return np.inf, 0.0  # Can't reverse - infinite cost
+    
+    # Check boundary
+    if is_near_boundary(my_pose, map_size, cfg.mapBoundaryMargin):
+        return np.inf, 0.0  # Can't reverse near boundary
+    
+    # Calculate reverse cost
+    # Cost = distance * cost_per_meter + opportunity cost (lose progress toward goal)
+    reverse_cost = (estimated_reverse_dist * cfg.reverseCostPerMeter + 
+                    estimated_reverse_dist / cfg.targetLinearVel * cfg.waitCostPerSecond)
+    
+    # Calculate wait cost
+    # Estimate how long other robot will take to clear based on their speed and distance
+    other_speed = np.linalg.norm(other_robot.velocity)
+    if other_speed > 0.05:
+        # Other is moving - estimate time to clear
+        clearance_dist = curr_dist + cfg.safetyDistance
+        estimated_wait_time = clearance_dist / other_speed
+    else:
+        # Other is stopped - assume they'll wait indefinitely
+        estimated_wait_time = 10.0  # Large penalty for waiting on stopped robot
+    
+    wait_cost = estimated_wait_time * cfg.waitCostPerSecond
+    
+    # Adjust costs based on priority (distance to goal)
+    # If I'm much closer to goal, increase the wait cost (I should go)
+    # If other is much closer, decrease the wait cost (I should wait)
+    priority_ratio = other_dist_to_goal / (my_dist_to_goal + 0.01)
+    
+    if priority_ratio > 1.5:  # Other is 50%+ farther
+        # I'm much closer - increase wait cost
+        wait_cost *= 1.5
+    elif priority_ratio < 0.67:  # I'm 50%+ farther
+        # Other is much closer - decrease wait cost (I should wait)
+        wait_cost *= 0.5
+    
+    return reverse_cost, wait_cost
+
+def negotiate_velocity(my_robot: RobotState, all_robots: Dict[str, RobotState], my_id: str, cfg: Config, v_ideal: float, priority_robots: List[str], sim_time: float, map_size: np.ndarray) -> Tuple[float, str, float]:
+    """
+    Cost-based collision avoidance with commitment to decisions.
+    Returns: (commanded_velocity, decision, target_reverse_distance)
+    decision is 'forward', 'reverse', or 'wait'
+    """
     my_pose = my_robot.pose
     my_dist_to_goal = np.sqrt((my_pose[0] - my_robot.goal[0])**2 + (my_pose[1] - my_robot.goal[1])**2)
     
-    v_cmd = v_ideal
+    i_have_priority = my_id in priority_robots
+    
+    # Check if we're in a committed decision
+    time_since_decision = sim_time - my_robot.decisionTime
+    if my_robot.reverseDecision is not None and time_since_decision < cfg.commitmentTime:
+        # Still committed to previous decision
+        if my_robot.reverseDecision == 'reverse':
+            # Check if we've reversed enough
+            reverse_dist = np.linalg.norm(my_robot.pose[:2] - my_robot.reverseStartPos)
+            if reverse_dist >= my_robot.reverseTargetDistance:
+                # Done reversing
+                my_robot.reverseDecision = None
+                return 0.0, 'wait', 0.0
+            else:
+                # Continue reversing
+                return -cfg.reverseVel, 'reverse', my_robot.reverseTargetDistance
+        elif my_robot.reverseDecision == 'forward':
+            # Continue forward cautiously
+            return v_ideal * 0.6, 'forward', 0.0
+        else:  # 'wait'
+            return 0.0, 'wait', 0.0
+    
+    # Decision commitment expired or no decision - make new decision
+    my_robot.reverseDecision = None
+    
+    # Collect conflicts
+    conflicts = []
     
     for rid, other_robot in all_robots.items():
-        if rid == my_id or other_robot.reached:
+        if rid == my_id:
             continue
         
         other_pose = other_robot.pose
-        
-        # Current distance
         curr_dist = np.sqrt((my_pose[0] - other_pose[0])**2 + (my_pose[1] - other_pose[1])**2)
         
-        # Emergency stop
-        if curr_dist < cfg.emergencyDistance:
-            return 0.0
+        # ABSOLUTE HARD STOP - collision imminent
+        if check_any_collision(my_pose, other_pose, cfg):
+            return 0.0, 'wait', 0.0
         
-        # Check for box collision at current positions
-        if check_box_collision(my_pose, other_pose, cfg):
-            return 0.0
+        # Hard distance check
+        if curr_dist < cfg.safetyDistance:
+            return 0.0, 'wait', 0.0
         
-        # Predict future positions
-        T = cfg.coordinationHorizon
-        my_pred_x = my_pose[0] + v_ideal * np.cos(my_pose[2]) * T
-        my_pred_y = my_pose[1] + v_ideal * np.sin(my_pose[2]) * T
-        my_pred_pose = np.array([my_pred_x, my_pred_y, my_pose[2]])
-        
-        other_vx, other_vy = other_robot.velocity
-        other_pred_x = other_pose[0] + other_vx * T
-        other_pred_y = other_pose[1] + other_vy * T
-        other_pred_pose = np.array([other_pred_x, other_pred_y, other_pose[2]])
-        
-        # Check predicted collision
-        pred_dist = np.sqrt((my_pred_x - other_pred_x)**2 + (my_pred_y - other_pred_y)**2)
-        
-        if pred_dist < cfg.safeSeparation or check_box_collision(my_pred_pose, other_pred_pose, cfg):
-            # Priority based on distance to goal
-            other_dist_to_goal = np.sqrt((other_pose[0] - other_robot.goal[0])**2 + (other_pose[1] - other_robot.goal[1])**2)
+        # Only consider conflicts within decision distance
+        if curr_dist < cfg.decisionDistance:
+            other_dist_to_goal = np.sqrt((other_pose[0] - other_robot.goal[0])**2 + 
+                                         (other_pose[1] - other_robot.goal[1])**2) if not other_robot.reached else np.inf
             
-            if my_dist_to_goal > other_dist_to_goal:
-                # Other robot has priority
-                v_cmd = min(v_cmd, v_ideal * 0.3)
+            conflicts.append({
+                'rid': rid,
+                'robot': other_robot,
+                'distance': curr_dist,
+                'dist_to_goal': other_dist_to_goal,
+                'is_parked': other_robot.reached
+            })
     
-    return max(0.0, v_cmd)
+    # No conflicts - go forward
+    if not conflicts:
+        return v_ideal, 'forward', 0.0
+    
+    # Sort by distance
+    conflicts.sort(key=lambda x: x['distance'])
+    
+    # Find critical conflict
+    critical_conflict = None
+    for conflict in conflicts:
+        # Parked robots - just avoid
+        if conflict['is_parked']:
+            if conflict['distance'] < cfg.emergencyDistance + 0.1:
+                return 0.0, 'wait', 0.0
+            continue
+        
+        # Check trajectory collision
+        will_collide = check_trajectory_collision(
+            my_pose, v_ideal, conflict['robot'].pose, conflict['robot'].velocity,
+            cfg, cfg.coordinationHorizon
+        )
+        
+        if will_collide or conflict['distance'] < cfg.emergencyDistance:
+            critical_conflict = conflict
+            break
+    
+    # No critical conflicts
+    if critical_conflict is None:
+        return v_ideal * 0.7, 'forward', 0.0
+    
+    # We have a critical conflict - calculate costs
+    other_robot = critical_conflict['robot']
+    
+    # If other robot is stopped, try to go around
+    other_speed = np.linalg.norm(other_robot.velocity)
+    if other_speed < 0.05:
+        return v_ideal * 0.3, 'forward', 0.0
+    
+    # Traffic jam priority
+    if i_have_priority:
+        my_robot.reverseDecision = 'forward'
+        my_robot.decisionTime = sim_time
+        return v_ideal * 0.5, 'forward', 0.0
+    
+    # Calculate cost-benefit
+    reverse_cost, wait_cost = calculate_reverse_cost_benefit(
+        my_robot, other_robot, my_id, cfg, all_robots, map_size
+    )
+    
+    # Make decision based on costs
+    if reverse_cost < wait_cost - cfg.reverseMinBenefit:
+        # Reversing is significantly better - commit to it
+        estimated_reverse_dist = max(0.3, cfg.safetyDistance - critical_conflict['distance'] + 0.2)
+        estimated_reverse_dist = min(estimated_reverse_dist, cfg.maxReverseDistance)
+        
+        my_robot.reverseDecision = 'reverse'
+        my_robot.decisionTime = sim_time
+        my_robot.reverseTargetDistance = estimated_reverse_dist
+        my_robot.reverseStartPos = my_robot.pose[:2].copy()
+        
+        return -cfg.reverseVel, 'reverse', estimated_reverse_dist
+    else:
+        # Waiting is better or costs are similar
+        my_robot.reverseDecision = 'wait'
+        my_robot.decisionTime = sim_time
+        return 0.0, 'wait', 0.0
 
 # === MAIN SIMULATOR ===
 
@@ -496,6 +813,7 @@ def multi_robot_simulator():
     
     colors = plt.cm.get_cmap('hsv', SIM.numRobots)
     plot_handles = {}
+    robotIds = list(robots.keys())  # Store robot IDs for color indexing
     
     for i, (rid, robot) in enumerate(robots.items()):
         col = colors(i)
@@ -505,7 +823,8 @@ def multi_robot_simulator():
             'traj': ax.plot([], [], '-', color=col, linewidth=1.5, alpha=0.7)[0],
             'robot': ax.plot([], [], 'o', color=col, markersize=10)[0],
             'heading': ax.plot([], [], '-', color=col, linewidth=2)[0],
-            'box': ax.plot([], [], '-', color=col, linewidth=1.5)[0]
+            'box': ax.plot([], [], '-', color=col, linewidth=1.5)[0],
+            'hardCircle': ax.plot([], [], ':', color=col, linewidth=2, alpha=0.6)[0]  # Hard collision circle
         }
     
     title = ax.set_title('Multi-Robot Simulation (A* + Dubins)')
@@ -529,6 +848,9 @@ def multi_robot_simulator():
         # Control each robot
         num_reached = sum(1 for r in robots.values() if r.reached)
         
+        # Detect traffic jams and assign priority
+        priority_robots = detect_traffic_jam(robots, CFG, sim_time)
+        
         for rid, robot in robots.items():
             if robot.reached:
                 continue
@@ -545,44 +867,89 @@ def multi_robot_simulator():
             pos_change = np.linalg.norm(robot.pose[:2] - robot.lastPosition)
             if pos_change < 0.01:
                 robot.stuckCounter += 1
+                robot.waitingTime += SIM.dt
+                robot.totalWaitTime += SIM.dt
             else:
                 robot.stuckCounter = 0
+                robot.waitingTime = 0.0
+                robot.inTrafficJam = False
+                
             robot.lastPosition = robot.pose[:2].copy()
+            
+            # Mark if in traffic jam
+            if robot.waitingTime > CFG.trafficJamTimeout:
+                robot.inTrafficJam = True
             
             # Replan if needed
             should_replan = (
                 (sim_time - robot.lastReplanTime) >= CFG.replanInterval or
-                robot.stuckCounter > 15
+                robot.stuckCounter > CFG.stuckThreshold or
+                robot.inTrafficJam
             )
             
             if should_replan:
                 # Create obstacle map from other robots
                 other_robots_list = []
                 for other_id, other_robot in robots.items():
-                    if other_id != rid and not other_robot.reached:
+                    if other_id != rid:  # Include ALL other robots (moving AND parked)
                         other_robots_list.append({
                             'x': other_robot.pose[0],
                             'y': other_robot.pose[1],
-                            'vx': other_robot.velocity[0],
-                            'vy': other_robot.velocity[1]
+                            'vx': other_robot.velocity[0] if not other_robot.reached else 0.0,
+                            'vy': other_robot.velocity[1] if not other_robot.reached else 0.0,
+                            'reached': other_robot.reached  # Track if parked
                         })
                 
                 obstacle_map = planner.create_obstacle_map(other_robots_list)
-                new_path = planner.plan(robot.pose, robot.goal, obstacle_map)
                 
-                if new_path is not None:
-                    robot.path = new_path
+                # For car-like robots, the start heading matters
+                # A* doesn't account for heading, so we accept this limitation
+                # In production, would use Hybrid A* or RRT with Dubins curves
+                newPath = planner.plan(robot.pose, robot.goal, obstacle_map)
+                
+                if newPath is not None:
+                    robot.path = newPath
                     robot.replanCount += 1
                     robot.stuckCounter = 0
                     plot_handles[rid]['path'].set_data(robot.path.x, robot.path.y)
+                else:
+                    # No path found - calculate if reversing would help
+                    if is_reverse_path_clear(robot.pose, robots, rid, CFG, SIM.mapSize, 0.3):
+                        # Make a reverse decision with short distance
+                        robot.reverseDecision = 'reverse'
+                        robot.decisionTime = sim_time
+                        robot.reverseTargetDistance = 0.3
+                        robot.reverseStartPos = robot.pose[:2].copy()
                 
                 robot.lastReplanTime = sim_time
             
             # Pure pursuit control
             lin_vel, ang_vel = pure_pursuit_control(robot, CFG)
             
-            # Collision avoidance
-            lin_vel = negotiate_velocity(robot, robots, rid, CFG, lin_vel)
+            # Collision avoidance and decision making
+            v_cmd, decision, target_reverse_dist = negotiate_velocity(
+                robot, robots, rid, CFG, lin_vel, priority_robots, sim_time, SIM.mapSize
+            )
+            
+            # Execute decision
+            if decision == 'reverse':
+                lin_vel = -CFG.reverseVel
+                ang_vel = 0.0  # No turning while reversing
+                
+                # Safety check while reversing
+                if not is_reverse_path_clear(robot.pose, robots, rid, CFG, SIM.mapSize, CFG.reverseVel * SIM.dt * 2):
+                    robot.reverseDecision = None  # Abort reverse
+                    lin_vel = 0.0
+            elif decision == 'wait':
+                lin_vel = 0.0
+                ang_vel = 0.0
+            else:  # 'forward'
+                lin_vel = v_cmd
+                # ang_vel already set by pure pursuit
+            
+            # Car-like constraint: Can only turn when moving
+            if abs(lin_vel) < CFG.minVelForTurning:
+                ang_vel = 0.0
             
             # Update state
             robot.pose[0] += lin_vel * np.cos(robot.pose[2]) * SIM.dt
@@ -594,14 +961,46 @@ def multi_robot_simulator():
         # Update visualization
         if frame_count % 2 == 0 or not SIM.realTimeMode:
             for rid, robot in robots.items():
+                col = colors(robotIds.index(rid))
+                
                 if robot.reached:
-                    plot_handles[rid]['robot'].set_data([], [])
-                    plot_handles[rid]['heading'].set_data([], [])
-                    plot_handles[rid]['box'].set_data([], [])
+                    # Keep showing parked robots in a dimmed state
+                    plot_handles[rid]['robot'].set_data([robot.pose[0]], [robot.pose[1]])
+                    plot_handles[rid]['robot'].set_markerfacecolor(col)
+                    plot_handles[rid]['robot'].set_markeredgecolor(col)
+                    plot_handles[rid]['robot'].set_alpha(0.3)  # Dim the robot
+                    
+                    # Show the box dimmed
+                    hl, hw = CFG.robotLength / 2, CFG.robotWidth / 2
+                    corners = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw], [hl, hw]])
+                    cos_t, sin_t = np.cos(robot.pose[2]), np.sin(robot.pose[2])
+                    R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+                    rotated = (R @ corners.T).T + robot.pose[:2]
+                    plot_handles[rid]['box'].set_data(rotated[:, 0], rotated[:, 1])
+                    plot_handles[rid]['box'].set_alpha(0.3)  # Dim the box
+                    
+                    # Show hard collision circle dimmed
+                    theta_circle = np.linspace(0, 2 * np.pi, 30)
+                    circleX = robot.pose[0] + CFG.hardCollisionRadius * np.cos(theta_circle)
+                    circleY = robot.pose[1] + CFG.hardCollisionRadius * np.sin(theta_circle)
+                    plot_handles[rid]['hardCircle'].set_data(circleX, circleY)
+                    plot_handles[rid]['hardCircle'].set_alpha(0.2)  # Dim the circle
+                    
+                    plot_handles[rid]['heading'].set_data([], [])  # Hide heading arrow
                     continue
                 
-                # Robot position
+                # Active robot visualization
+                # Robot position - change color if reversing
                 plot_handles[rid]['robot'].set_data([robot.pose[0]], [robot.pose[1]])
+                plot_handles[rid]['robot'].set_alpha(1.0)  # Full opacity
+                if robot.reverseDecision == 'reverse':
+                    # Make robot red when reversing
+                    plot_handles[rid]['robot'].set_markerfacecolor('red')
+                    plot_handles[rid]['robot'].set_markeredgecolor('red')
+                else:
+                    # Normal color
+                    plot_handles[rid]['robot'].set_markerfacecolor(col)
+                    plot_handles[rid]['robot'].set_markeredgecolor(col)
                 
                 # Heading arrow
                 arrow_len = 0.25
@@ -616,6 +1015,14 @@ def multi_robot_simulator():
                 R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
                 rotated = (R @ corners.T).T + robot.pose[:2]
                 plot_handles[rid]['box'].set_data(rotated[:, 0], rotated[:, 1])
+                plot_handles[rid]['box'].set_alpha(1.0)  # Full opacity
+                
+                # Hard collision circle (0.25m radius) - dotted line
+                theta_circle = np.linspace(0, 2 * np.pi, 30)
+                circleX = robot.pose[0] + CFG.hardCollisionRadius * np.cos(theta_circle)
+                circleY = robot.pose[1] + CFG.hardCollisionRadius * np.sin(theta_circle)
+                plot_handles[rid]['hardCircle'].set_data(circleX, circleY)
+                plot_handles[rid]['hardCircle'].set_alpha(0.6)  # Semi-transparent
                 
                 # Trajectory
                 traj = np.array(robot.trajectory)
