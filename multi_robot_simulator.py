@@ -202,9 +202,8 @@ def check_box_collision(pose1: np.ndarray, pose2: np.ndarray, cfg: Config) -> bo
     return True  # No separating axis found - collision
 
 # === A* PATH PLANNER (Much faster than RRT*) ===
-
 class AStarPlanner:
-    """Grid-based A* planner with dynamic obstacle handling."""
+    """Grid-based A* planner with road width constraint for robot clearance."""
     
     def __init__(self, map_size: np.ndarray, resolution: float, cfg: Config):
         self.map_size = map_size
@@ -214,12 +213,18 @@ class AStarPlanner:
         self.grid_width = int(np.ceil(map_size[0] / resolution))
         self.grid_height = int(np.ceil(map_size[1] / resolution))
         
+        # Calculate road width in grid cells (robot width + safety margins)
+        # Need clearance on both sides of the centerline
+        road_width_meters = cfg.robotWidth + 2 * cfg.safetyBuffer
+        self.road_half_width_cells = int(np.ceil(road_width_meters / (2 * resolution)))
+        
         # 8-connectivity
         self.motions = [
             [1, 0, 1.0], [0, 1, 1.0], [-1, 0, 1.0], [0, -1, 1.0],
             [1, 1, 1.414], [1, -1, 1.414], [-1, 1, 1.414], [-1, -1, 1.414]
         ]
-    
+
+
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
         """Convert world coordinates to grid indices."""
         gx = int(np.floor(x / self.resolution))
