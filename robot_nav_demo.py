@@ -176,7 +176,7 @@ class RobotStateMachine:
 if __name__ == "__main__":
     # Replace with your robot ID (e.g., "777", "805")
     ROBOT_ID = "777"
-    MQTT_BROKER = "localhost"  # Replace with your MQTT broker address
+    MQTT_BROKER = "rasticvm.lan" 
     
     robot = RobotStateMachine(ROBOT_ID, MQTT_BROKER)
     robot.run()
