@@ -574,9 +574,9 @@ class RobotController:
         """Callback when connected to MQTT broker"""
         print(f"Connected to MQTT broker with result code {rc}")
         
-        cmd_topic = f"cmd/limo{self.robot_id}"
-        goal_topic = f"goal/limo{self.robot_id}"
-        odom_topic = f"rb/limo{self.robot_id}/odom"
+        cmd_topic = f"cmd/limo{self.robot_num}"
+        goal_topic = f"goal/limo{self.robot_num}"
+        odom_topic = f"rb/limo{self.robot_num}/odom"
         
         client.subscribe(cmd_topic)
         client.subscribe(goal_topic)
@@ -992,7 +992,8 @@ def main():
     print()
     
     # Get robot ID
-    robot_id = input("Enter robot ID (e.g., limo101): ").strip()
+    robot_id = input("Enter last 3 of robot IP: ").strip()
+    robot_num = input("Enter robot ID (e.g., limo101): ").strip()
     
     if not robot_id:
         print("Error: Robot ID cannot be empty")
