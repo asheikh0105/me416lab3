@@ -523,8 +523,9 @@ def negotiate_velocity(my_robot: MyRobotState, other_robots: Dict[str, RobotStat
 # === ROBOT CONTROLLER CLASS ===
 
 class RobotController:
-    def __init__(self, robot_id: str, cfg: Config):
-        self.robot_id = robot_id
+    def __init__(self, robot_id: str, ip_suffix: str, cfg: Config):
+        self.robot_id = robot_id  # e.g., "limo777"
+        self.ip_suffix = ip_suffix  # e.g., "101"
         self.cfg = cfg
         
         # Robot state
@@ -548,7 +549,9 @@ class RobotController:
         self.sim_time = 0.0
         self.running = False
         
-        print(f"Robot Controller initialized for {robot_id}")
+        print(f"Robot Controller initialized:")
+        print(f"  Robot ID (MQTT): {robot_id}")
+        print(f"  IP Suffix (TCP): {ip_suffix}")
         print(f"  Min Turn Radius: {cfg.minTurnRadius:.3f}m")
         print(f"  Robot Size: {cfg.robotLength:.2f}m x {cfg.robotWidth:.2f}m")
         print(f"  Clearance Radius: {cfg.robotClearanceRadius:.3f}m")
@@ -570,19 +573,32 @@ class RobotController:
             print("This is expected if you're not on the lab network.")
             raise
     
-    def on_mqtt_connect(self, client, userdata, flags, rc, properties=None):
-        """Callback when connected to MQTT broker"""
+    def on_mqtt_connect(self, client, userdata, flags, rc):
         print(f"Connected to MQTT broker with result code {rc}")
         
-        cmd_topic = f"cmd/limo{self.robot_num}"
-        goal_topic = f"goal/limo{self.robot_num}"
-        odom_topic = f"rb/limo{self.robot_num}/odom"
+        # Subscribe to my position
+        my_topic = f"rb/{self.robot_id}"
+        client.subscribe(my_topic)
+        print(f"  Subscribed to: {my_topic}")
         
-        client.subscribe(cmd_topic)
+        # Subscribe to all other robot positions (assuming robot IDs from 001 to 999)
+        for i in range(1, 100):  # Adjust range as needed
+            other_id = f"limo{i:03d}"
+            if other_id != self.robot_id:
+                other_topic = f"rb/{other_id}"
+                client.subscribe(other_topic)
+        print(f"  Subscribed to all rb/limoXXX topics")
+        
+        # Subscribe to goal
+        goal_topic = f"goal/{self.robot_id}"
         client.subscribe(goal_topic)
-        client.subscribe(odom_topic)
-        print(f"Subscribed to {cmd_topic}, {goal_topic}, and {odom_topic}")
+        print(f"  Subscribed to: {goal_topic}")
         
+        # Subscribe to commands
+        cmd_topic = f"cmd/{self.robot_id}"
+        client.subscribe(cmd_topic)
+        print(f"  Subscribed to: {cmd_topic}")
+    
     def on_mqtt_message(self, client, userdata, msg):
         """Handle incoming MQTT messages."""
         topic = msg.topic
@@ -715,7 +731,7 @@ class RobotController:
     
     def setup_tcp(self):
         """Setup TCP connection to LIMO."""
-        limo_ip = self.cfg.limoIpPrefix + self.robot_id[-3:]
+        limo_ip = self.cfg.limoIpPrefix + self.ip_suffix
         
         print(f"Connecting to LIMO TCP: {limo_ip}:{self.cfg.limoTcpPort}")
         
@@ -991,21 +1007,29 @@ def main():
     print("      - Motion capture system publishing to rb/limoXXX")
     print()
     
-    # Get robot ID
-    robot_id = input("Enter last 3 of robot IP: ").strip()
-    robot_num = input("Enter robot ID (e.g., limo101): ").strip()
+    # Get robot ID for MQTT topics
+    robot_id = input("Enter LIMO ID for MQTT topics (e.g., limo777): ").strip()
     
     if not robot_id:
         print("Error: Robot ID cannot be empty")
         return
     
-    print(f"\nInitializing controller for {robot_id}...")
+    # Get IP address suffix
+    ip_suffix = input("Enter IP address last 3 digits (e.g., 101): ").strip()
+    
+    if not ip_suffix:
+        print("Error: IP suffix cannot be empty")
+        return
+    
+    print(f"\nInitializing controller...")
+    print(f"  MQTT Topics: rb/{robot_id}, goal/{robot_id}, cmd/{robot_id}")
+    print(f"  TCP Address: 192.168.1.{ip_suffix}:12345")
     
     # Create configuration
     cfg = Config()
     
     # Create and run controller
-    controller = RobotController(robot_id, cfg)
+    controller = RobotController(robot_id, ip_suffix, cfg)
     controller.run()
 
 if __name__ == '__main__':
