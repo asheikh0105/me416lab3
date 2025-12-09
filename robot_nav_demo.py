@@ -760,6 +760,8 @@ class RobotStateMachine:
         
         print(f"Robot State Machine initialized for robot {robot_id}")
         print(f"Will publish motor commands to: {self.command_topic}")
+        self.last_odom_pose = None
+
         
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
@@ -767,11 +769,13 @@ class RobotStateMachine:
         
         cmd_topic = f"cmd/limo{self.robot_id}"
         goal_topic = f"goal/limo{self.robot_id}"
+        odom_topic = f"rb/limo{self.robot_id}/odom"  # Subscribe to odometry
         
         client.subscribe(cmd_topic)
         client.subscribe(goal_topic)
-        print(f"Subscribed to {cmd_topic} and {goal_topic}")
-        
+        client.subscribe(odom_topic)
+        print(f"Subscribed to {cmd_topic}, {goal_topic}, and {odom_topic}")
+
     def on_message(self, client, userdata, msg):
         """Callback when message received"""
         topic = msg.topic
@@ -781,7 +785,54 @@ class RobotStateMachine:
             self.handle_command(payload)
         elif topic.startswith("goal/"):
             self.handle_goal(payload)
+        elif topic.endswith("/odom"):
+            self.handle_odometry(payload)
+
     
+    def handle_odometry(self, odom_json: str):
+        """Handle odometry updates from robot"""
+        try:
+            odom_data = json.loads(odom_json)
+            x = odom_data.get('x', 0.0)
+            y = odom_data.get('y', 0.0)
+            theta = odom_data.get('theta', 0.0)
+            
+            self.last_odom_pose = np.array([x, y, theta])
+            
+            # Try to match this to MoCap data
+            if self.mocap_interface is not None:
+                self.mocap_interface.match_robot_to_mocap(self.last_odom_pose)
+            
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            print(f"Error parsing odometry message: {e}")
+    
+    def update_mocap_data(self):
+        """
+        Update robot pose and obstacle positions from MoCap system.
+        Now uses odometry matching!
+        """
+        if self.mocap_interface is None:
+            return
+        
+        # Get MY robot's pose from MoCap (already matched via odometry)
+        my_pose = self.mocap_interface.get_rigid_body_pose(f"limo{self.robot_id}")
+        if my_pose is not None:
+            self.navigator.set_pose(my_pose['x'], my_pose['y'], my_pose['theta'])
+            
+            if not self.pose_initialized:
+                self.pose_initialized = True
+                print(f"✓ Initial MoCap pose: ({my_pose['x']:.2f}, {my_pose['y']:.2f})")
+        
+        # Get ALL other robots as obstacles (automatically excludes your robot)
+        all_obstacles = self.mocap_interface.get_all_rigid_bodies()
+        for obstacle_name, pose in all_obstacles.items():
+            self.navigator.update_obstacle(
+                obstacle_name,
+                pose['x'],
+                pose['y'],
+                pose.get('theta', 0.0)
+            )
+
     def handle_command(self, command: str):
         """Handle run state commands"""
         print(f"Received command: {command}")
@@ -1022,9 +1073,11 @@ class OptiTrackMoCapInterface:
         self.server_ip = server_ip
         self.data_port = data_port
         
-        # Storage for rigid body poses
-        self.rigid_bodies = {}
+        # Storage for ALL rigid body poses
+        self.all_rigid_bodies = {}  # {rb_id: {'x', 'y', 'theta', 'timestamp'}}
         self.lock = Lock()
+
+        self.my_rb_id = None
         
         # Networking
         self.socket = None
@@ -1035,16 +1088,13 @@ class OptiTrackMoCapInterface:
     
     def start(self):
         """Start receiving MoCap data"""
-        # Create multicast socket
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind(('', self.data_port))
         
-        # Join multicast group
         mreq = struct.pack("4sl", socket.inet_aton(self.server_ip), socket.INADDR_ANY)
         self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         
-        # Start receiving thread
         self.running = True
         self.thread = Thread(target=self._receive_loop, daemon=True)
         self.thread.start()
@@ -1059,6 +1109,7 @@ class OptiTrackMoCapInterface:
         if self.thread:
             self.thread.join()
         print("OptiTrack streaming stopped")
+
     
     def _receive_loop(self):
         """Receive and parse NatNet packets"""
@@ -1069,13 +1120,10 @@ class OptiTrackMoCapInterface:
             except Exception as e:
                 if self.running:
                     print(f"Error receiving MoCap data: {e}")
+
     
     def _parse_frame(self, data):
-        """
-        Parse NatNet frame data.
-        This is a simplified parser - you may need to adjust based on 
-        your OptiTrack/Motive version.
-        """
+        """Parse NatNet frame data and store ALL rigid bodies"""
         try:
             offset = 0
             
@@ -1086,6 +1134,10 @@ class OptiTrackMoCapInterface:
             # Packet size (2 bytes)
             packet_size = struct.unpack('H', data[offset:offset+2])[0]
             offset += 2
+            
+            # Only process frame data (message_id == 7)
+            if message_id != 7:
+                return
             
             # Frame number (4 bytes)
             frame_num = struct.unpack('I', data[offset:offset+4])[0]
@@ -1110,19 +1162,17 @@ class OptiTrackMoCapInterface:
                 offset += 16
                 
                 # Convert to 2D pose
-                # OptiTrack Y-up -> Our Z-up for 2D navigation
                 pose_x = x
-                pose_y = z  # Swap Y and Z
+                pose_y = z  # Swap Y and Z for 2D navigation
                 
-                # Calculate yaw from quaternion (rotation around vertical)
+                # Calculate yaw from quaternion
                 siny_cosp = 2.0 * (qw * qy + qz * qx)
                 cosy_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
                 theta = np.arctan2(siny_cosp, cosy_cosp)
                 
-                # Store pose
+                # Store ALL rigid bodies by their OptiTrack ID
                 with self.lock:
-                    rb_name = self._get_rigid_body_name(rb_id)
-                    self.rigid_bodies[rb_name] = {
+                    self.all_rigid_bodies[rb_id] = {
                         'x': pose_x,
                         'y': pose_y,
                         'theta': theta,
@@ -1130,47 +1180,88 @@ class OptiTrackMoCapInterface:
                     }
                 
         except Exception as e:
-            # Silently ignore parse errors (common with protocol mismatches)
+            # Silently ignore parse errors
             pass
     
-    def _get_rigid_body_name(self, rb_id: int) -> str:
+    def match_robot_to_mocap(self, robot_odom_pose: np.ndarray, max_distance: float = 0.5):
         """
-        Map rigid body ID to robot name.
-        UPDATE THIS based on your Motive setup!
+        Match your robot's odometry to a MoCap rigid body.
+        Call this once you have odometry data.
+        
+        Args:
+            robot_odom_pose: [x, y, theta] from robot's odometry
+            max_distance: Maximum distance to consider a match (meters)
         """
-        # Check Motive to see what streaming ID each robot has
-        id_to_name = {
-            1: "limo777",
-            2: "limo805", 
-            3: "limo809",
-        }
-        return id_to_name.get(rb_id, f"unknown_{rb_id}")
-    
-    def get_rigid_body_pose(self, rigid_body_name: str) -> Optional[Dict]:
-        """Get current pose of a rigid body"""
         with self.lock:
-            if rigid_body_name in self.rigid_bodies:
-                pose = self.rigid_bodies[rigid_body_name]
-                age = time.time() - pose['timestamp']
+            if len(self.all_rigid_bodies) == 0:
+                return False
+            
+            # Find closest rigid body to odometry position
+            robot_pos = robot_odom_pose[:2]
+            closest_id = None
+            closest_dist = float('inf')
+            
+            for rb_id, pose in self.all_rigid_bodies.items():
+                rb_pos = np.array([pose['x'], pose['y']])
+                dist = np.linalg.norm(rb_pos - robot_pos)
                 
-                if age < 0.5:  # Fresh data (< 500ms old)
-                    return {
-                        'x': pose['x'],
-                        'y': pose['y'],
-                        'theta': pose['theta']
-                    }
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest_id = rb_id
+            
+            # Only match if within reasonable distance
+            if closest_dist < max_distance:
+                if self.my_rb_id != closest_id:
+                    self.my_rb_id = closest_id
+                    print(f"✓ Matched robot odometry to MoCap rigid body ID={closest_id} (dist={closest_dist:.2f}m)")
+                return True
+            else:
+                print(f"⚠ No MoCap rigid body within {max_distance}m of odometry position")
+                return False
+
+    
+
+    def get_rigid_body_pose(self, rigid_body_name: str) -> Optional[Dict]:
+        """
+        Get pose for your robot (must call match_robot_to_mocap first).
+        """
+        if "limo" in rigid_body_name:
+            # This is asking for OUR robot
+            with self.lock:
+                if self.my_rb_id is None:
+                    return None  # Haven't matched yet
+                
+                if self.my_rb_id in self.all_rigid_bodies:
+                    pose = self.all_rigid_bodies[self.my_rb_id]
+                    age = time.time() - pose['timestamp']
+                    
+                    if age < 0.5:  # Fresh data
+                        return {
+                            'x': pose['x'],
+                            'y': pose['y'],
+                            'theta': pose['theta']
+                        }
+        
         return None
+
     
     def get_all_rigid_bodies(self) -> Dict[str, Dict]:
-        """Get all tracked rigid bodies"""
+        """
+        Get all rigid bodies EXCEPT your robot (i.e., obstacles only).
+        """
         result = {}
         current_time = time.time()
         
         with self.lock:
-            for name, pose in self.rigid_bodies.items():
+            for rb_id, pose in self.all_rigid_bodies.items():
+                # Skip YOUR robot - only return obstacles
+                if rb_id == self.my_rb_id:
+                    continue
+                
                 age = current_time - pose['timestamp']
                 if age < 0.5:  # Only recent data
-                    result[name] = {
+                    # Name obstacles by their OptiTrack ID
+                    result[f"obstacle_{rb_id}"] = {
                         'x': pose['x'],
                         'y': pose['y'],
                         'theta': pose['theta']
@@ -1475,36 +1566,12 @@ if __name__ == "__main__":
     robot.mocap_interface = mocap
     
     # Wait for first pose data
-    print(f"Waiting for MoCap data for limo{ROBOT_ID}...")
-    timeout = 10  # seconds
-    start_wait = time.time()
+    print(f"\n✓ Ready! Waiting for odometry from limo{ROBOT_ID} to match with MoCap...")
+    print("  Robot will auto-match itself to MoCap rigid bodies using odometry.")
+    print("  All other rigid bodies will be treated as obstacles.\n")
     
-    while not mocap.get_rigid_body_pose(f"limo{ROBOT_ID}"):
-        if time.time() - start_wait > timeout:
-            print(f"⚠ Warning: No MoCap data received for limo{ROBOT_ID} after {timeout}s")
-            print("   Make sure:")
-            print("   1. Motive is streaming data (View → Data Streaming)")
-            print(f"   2. Rigid body 'limo{ROBOT_ID}' exists in Motive")
-            print("   3. Check rigid body ID mapping in OptiTrackMoCapInterface")
-            print("\n   Continuing anyway - robot will wait for data...")
-            break
-        time.sleep(0.1)
-    else:
-        pose = mocap.get_rigid_body_pose(f"limo{ROBOT_ID}")
-        print(f"✓ Tracking limo{ROBOT_ID} at ({pose['x']:.2f}, {pose['y']:.2f})")
-    
-    print("\nStarting robot control loop...")
-    print("Send commands via MQTT:")
-    print(f'  mosquitto_pub -h {MQTT_BROKER} -t "cmd/limo{ROBOT_ID}" -m "WAIT"')
-    print(f'  mosquitto_pub -h {MQTT_BROKER} -t "goal/limo{ROBOT_ID}" -m \'{{"goal": [2.0, 1.0]}}\'')
-    print(f'  mosquitto_pub -h {MQTT_BROKER} -t "cmd/limo{ROBOT_ID}" -m "GO"')
-    print(f'  mosquitto_pub -h {MQTT_BROKER} -t "cmd/limo{ROBOT_ID}" -m "STOP"')
-    print(f'  mosquitto_pub -h {MQTT_BROKER} -t "cmd/limo{ROBOT_ID}" -m "HALT"')
-    print("\nPress Ctrl-C to exit\n")
-    
-    # Run the main loop
+    # Run
     try:
         robot.run()
     finally:
-        # Make sure to stop MoCap streaming
         mocap.stop()
