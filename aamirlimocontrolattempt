@@ -1,0 +1,1024 @@
+import numpy as np
+import time
+import socket
+import json
+import threading
+from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass
+import paho.mqtt.client as mqtt
+
+# === CONFIGURATION ===
+
+@dataclass
+class Config:
+    """Controller and Planning Configuration Parameters."""
+    # Pure Pursuit Controller
+    lookaheadDist: float = 0.4
+    targetLinearVel: float = 0.3
+    maxLinVel: float = 0.3
+    maxAngVel: float = np.deg2rad(90)
+    reverseVel: float = 0.15
+    minVelForTurning: float = 0.05
+    
+    # Robot Dimensions (car-like)
+    robotLength: float = 0.40
+    robotWidth: float = 0.30
+    safetyBuffer: float = 0.15
+    collisionBuffer: float = 0.12
+    hardCollisionRadius: float = 0.25
+    
+    # Dubins Parameters
+    maxSteeringAngle: float = np.deg2rad(35)
+    
+    # Path planning - A*
+    replanInterval: float = 0.6
+    gridResolution: float = 0.15
+    
+    # Dynamic obstacle parameters
+    predictionHorizon: float = 2.5
+    
+    # Local Collision Avoidance
+    coordinationHorizon: float = 2.0
+    safetyDistance: float = 0.55
+    emergencyDistance: float = 0.52
+    decisionDistance: float = 0.8
+    
+    # Cost-based reversing parameters
+    reverseCostPerMeter: float = 2.0
+    waitCostPerSecond: float = 0.5
+    progressBenefit: float = 1.0
+    reverseMinBenefit: float = 1.5
+    commitmentTime: float = 2.0
+    maxReverseDistance: float = 0.5
+    
+    # Map boundaries
+    mapBoundaryMargin: float = 0.3
+    mapSize: np.ndarray = None
+    
+    # Traffic jam detection
+    stuckThreshold: int = 90
+    trafficJamTimeout: float = 10.0
+    deadlockResetTime: float = 15.0
+    
+    # Tolerances
+    posTolerance: float = 0.25
+    headingTolerance: float = np.deg2rad(30)
+    
+    # Communication
+    mqttBroker: str = "rasticvm.lan"
+    mqttPort: int = 1883
+    limoTcpPort: int = 12345
+    limoIpPrefix: str = "192.168.1."
+    
+    # MoCap Origin
+    mocapOriginX: float = -4.5
+    mocapOriginY: float = 2.5
+    
+    # Control Loop
+    controlRate: float = 30.0
+    dt: float = 1.0 / 30.0
+    
+    def __post_init__(self):
+        """Calculate derived parameters."""
+        if self.mapSize is None:
+            self.mapSize = np.array([5.5, 5.0])
+        self.minTurnRadius = self.robotLength / np.tan(self.maxSteeringAngle)
+        R_diag = np.sqrt(self.robotWidth**2 + self.robotLength**2) / 2.0
+        self.robotClearanceRadius = R_diag + self.safetyBuffer + self.collisionBuffer
+        self.safeSeparation = 2 * self.robotClearanceRadius
+
+# === DATA STRUCTURES ===
+
+class Path:
+    def __init__(self, x: np.ndarray, y: np.ndarray):
+        self.x = x
+        self.y = y
+        self.s = self._calculate_arc_length(x, y)
+    
+    @staticmethod
+    def _calculate_arc_length(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        dx = np.diff(x)
+        dy = np.diff(y)
+        ds = np.sqrt(dx**2 + dy**2)
+        return np.insert(np.cumsum(ds), 0, 0.0)
+
+class RobotState:
+    def __init__(self, robot_id: str):
+        self.robot_id = robot_id
+        self.pose = np.array([0.0, 0.0, 0.0])  # x, y, theta
+        self.velocity = np.array([0.0, 0.0])
+        self.last_update_time = time.time()
+        self.valid = False
+
+class MyRobotState:
+    def __init__(self, robot_id: str):
+        self.robot_id = robot_id
+        self.pose = np.array([0.0, 0.0, 0.0])
+        self.goal = None
+        self.path = None
+        self.velocity = np.array([0.0, 0.0])
+        self.lastReplanTime = -np.inf
+        self.replanCount = 0
+        self.stuckCounter = 0
+        self.lastPosition = np.array([0.0, 0.0])
+        self.waitingTime = 0.0
+        self.totalWaitTime = 0.0
+        self.inTrafficJam = False
+        
+        # Cost-based reversing state
+        self.reverseDecision = None
+        self.decisionTime = -np.inf
+        self.reverseTargetDistance = 0.0
+        self.reverseStartPos = np.array([0.0, 0.0])
+        
+        # Previous pose for velocity calculation
+        self.prevPose = None
+        self.prevTime = None
+
+# === HELPER FUNCTIONS ===
+
+def wrap_to_pi(angle: float) -> float:
+    """Wraps an angle to the range (-pi, pi]."""
+    return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
+def check_circle_collision(pos1: np.ndarray, pos2: np.ndarray, radius1: float, radius2: float) -> bool:
+    """Check if two circles collide."""
+    dist = np.sqrt((pos2[0] - pos1[0])**2 + (pos2[1] - pos1[1])**2)
+    return dist < (radius1 + radius2)
+
+def check_box_collision(pose1: np.ndarray, pose2: np.ndarray, cfg: Config) -> bool:
+    """Check if two oriented bounding boxes collide using separating axis theorem."""
+    x1, y1, theta1 = pose1
+    x2, y2, theta2 = pose2
+    
+    dist = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+    if dist > (cfg.robotLength + cfg.robotWidth):
+        return False
+    
+    def get_corners(x, y, theta):
+        hl, hw = cfg.robotLength / 2, cfg.robotWidth / 2
+        corners = np.array([
+            [hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]
+        ])
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+        rotated = (R @ corners.T).T
+        return rotated + np.array([x, y])
+    
+    corners1 = get_corners(x1, y1, theta1)
+    corners2 = get_corners(x2, y2, theta2)
+    
+    axes = [
+        np.array([np.cos(theta1), np.sin(theta1)]),
+        np.array([-np.sin(theta1), np.cos(theta1)]),
+        np.array([np.cos(theta2), np.sin(theta2)]),
+        np.array([-np.sin(theta2), np.cos(theta2)])
+    ]
+    
+    for axis in axes:
+        proj1 = corners1 @ axis
+        proj2 = corners2 @ axis
+        
+        if proj1.max() < proj2.min() or proj2.max() < proj1.min():
+            return False
+    
+    return True
+
+def check_any_collision(pose1: np.ndarray, pose2: np.ndarray, cfg: Config) -> bool:
+    """Check if two robots collide using BOTH circle and box collision."""
+    if check_circle_collision(pose1[:2], pose2[:2], cfg.hardCollisionRadius, cfg.hardCollisionRadius):
+        return True
+    return check_box_collision(pose1, pose2, cfg)
+
+def is_near_boundary(pose: np.ndarray, map_size: np.ndarray, margin: float) -> bool:
+    """Check if robot is near map boundary."""
+    x, y = pose[0], pose[1]
+    return (x < margin or x > map_size[0] - margin or 
+            y < margin or y > map_size[1] - margin)
+
+# === A* PATH PLANNER ===
+
+class AStarPlanner:
+    """Grid-based A* planner with dynamic obstacle handling."""
+    
+    def __init__(self, map_size: np.ndarray, resolution: float, cfg: Config):
+        self.map_size = map_size
+        self.resolution = resolution
+        self.cfg = cfg
+        
+        self.grid_width = int(np.ceil(map_size[0] / resolution))
+        self.grid_height = int(np.ceil(map_size[1] / resolution))
+        
+        self.motions = [
+            [1, 0, 1.0], [0, 1, 1.0], [-1, 0, 1.0], [0, -1, 1.0],
+            [1, 1, 1.414], [1, -1, 1.414], [-1, 1, 1.414], [-1, -1, 1.414]
+        ]
+    
+    def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
+        gx = int(np.floor(x / self.resolution))
+        gy = int(np.floor(y / self.resolution))
+        return gx, gy
+    
+    def grid_to_world(self, gx: int, gy: int) -> Tuple[float, float]:
+        x = (gx + 0.5) * self.resolution
+        y = (gy + 0.5) * self.resolution
+        return x, y
+    
+    def is_valid(self, gx: int, gy: int) -> bool:
+        return 0 <= gx < self.grid_width and 0 <= gy < self.grid_height
+    
+    def create_obstacle_map(self, other_robots: List[Dict]) -> np.ndarray:
+        obstacle_map = np.zeros((self.grid_width, self.grid_height), dtype=bool)
+        
+        for robot in other_robots:
+            cx, cy = self.world_to_grid(robot['x'], robot['y'])
+            if self.is_valid(cx, cy):
+                hard_inflation = int(np.ceil(self.cfg.hardCollisionRadius / self.resolution))
+                for dx in range(-hard_inflation, hard_inflation + 1):
+                    for dy in range(-hard_inflation, hard_inflation + 1):
+                        gx, gy = cx + dx, cy + dy
+                        if self.is_valid(gx, gy):
+                            wx, wy = self.grid_to_world(gx, gy)
+                            dist = np.sqrt((wx - robot['x'])**2 + (wy - robot['y'])**2)
+                            if dist < self.cfg.hardCollisionRadius:
+                                obstacle_map[gx, gy] = True
+            
+            vx, vy = robot['vx'], robot['vy']
+            speed = np.sqrt(vx**2 + vy**2)
+            
+            if speed > 0.05:
+                pred_dist = speed * self.cfg.predictionHorizon
+                num_preds = max(3, int(pred_dist / self.resolution))
+                
+                for i in range(1, num_preds + 1):
+                    t = (i / num_preds) * self.cfg.predictionHorizon
+                    px = robot['x'] + vx * t
+                    py = robot['y'] + vy * t
+                    
+                    pgx, pgy = self.world_to_grid(px, py)
+                    if self.is_valid(pgx, pgy):
+                        inflation_cells = int(np.ceil(self.cfg.robotClearanceRadius / self.resolution))
+                        pred_inflation = max(1, int(inflation_cells * 0.7))
+                        for dx in range(-pred_inflation, pred_inflation + 1):
+                            for dy in range(-pred_inflation, pred_inflation + 1):
+                                gx, gy = pgx + dx, pgy + dy
+                                if self.is_valid(gx, gy):
+                                    obstacle_map[gx, gy] = True
+        
+        return obstacle_map
+    
+    def plan(self, start: np.ndarray, goal: np.ndarray, obstacle_map: np.ndarray) -> Optional[Path]:
+        start_gx, start_gy = self.world_to_grid(start[0], start[1])
+        goal_gx, goal_gy = self.world_to_grid(goal[0], goal[1])
+        
+        if not (self.is_valid(start_gx, start_gy) and self.is_valid(goal_gx, goal_gy)):
+            return None
+        
+        open_set = {(start_gx, start_gy)}
+        closed_set = set()
+        
+        g_score = {(start_gx, start_gy): 0}
+        f_score = {(start_gx, start_gy): self._heuristic(start_gx, start_gy, goal_gx, goal_gy)}
+        came_from = {}
+        
+        while open_set:
+            current = min(open_set, key=lambda n: f_score.get(n, np.inf))
+            
+            if current == (goal_gx, goal_gy):
+                path_grid = [current]
+                while current in came_from:
+                    current = came_from[current]
+                    path_grid.append(current)
+                path_grid.reverse()
+                
+                path_x = []
+                path_y = []
+                for gx, gy in path_grid:
+                    wx, wy = self.grid_to_world(gx, gy)
+                    path_x.append(wx)
+                    path_y.append(wy)
+                
+                return Path(np.array(path_x), np.array(path_y))
+            
+            open_set.remove(current)
+            closed_set.add(current)
+            
+            for motion in self.motions:
+                neighbor = (current[0] + motion[0], current[1] + motion[1])
+                
+                if not self.is_valid(neighbor[0], neighbor[1]):
+                    continue
+                
+                if obstacle_map[neighbor[0], neighbor[1]]:
+                    continue
+                
+                if neighbor in closed_set:
+                    continue
+                
+                tentative_g = g_score[current] + motion[2]
+                
+                if neighbor not in open_set:
+                    open_set.add(neighbor)
+                elif tentative_g >= g_score.get(neighbor, np.inf):
+                    continue
+                
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = tentative_g + self._heuristic(neighbor[0], neighbor[1], goal_gx, goal_gy)
+        
+        return None
+    
+    def _heuristic(self, x1: int, y1: int, x2: int, y2: int) -> float:
+        return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+
+# === PURE PURSUIT CONTROLLER ===
+
+def find_lookahead_point(robot_x: float, robot_y: float, path: Path, lookahead_dist: float) -> Tuple[float, float, float]:
+    distances = np.sqrt((path.x - robot_x)**2 + (path.y - robot_y)**2)
+    closest_idx = np.argmin(distances)
+    cross_track_error = distances[closest_idx]
+    
+    s_closest = path.s[closest_idx]
+    s_target = s_closest + lookahead_dist
+    
+    if s_target >= path.s[-1]:
+        return path.x[-1], path.y[-1], cross_track_error
+    
+    idx = np.searchsorted(path.s, s_target)
+    if idx >= len(path.x):
+        idx = len(path.x) - 1
+    
+    return path.x[idx], path.y[idx], cross_track_error
+
+def pure_pursuit_control(robot: MyRobotState, cfg: Config) -> Tuple[float, float]:
+    lookahead_x, lookahead_y, _ = find_lookahead_point(
+        robot.pose[0], robot.pose[1], robot.path, cfg.lookaheadDist
+    )
+    
+    dx = lookahead_x - robot.pose[0]
+    dy = lookahead_y - robot.pose[1]
+    desired_heading = np.arctan2(dy, dx)
+    heading_error = wrap_to_pi(desired_heading - robot.pose[2])
+    
+    is_forward = np.abs(heading_error) < np.deg2rad(90)
+    
+    if is_forward:
+        lin_vel = cfg.targetLinearVel * max(0.3, np.cos(heading_error))
+    else:
+        lin_vel = cfg.targetLinearVel * 0.2
+    
+    dist_to_lookahead = np.sqrt(dx**2 + dy**2)
+    if dist_to_lookahead > 1e-3 and lin_vel > cfg.minVelForTurning:
+        ang_vel = (2 * lin_vel * np.sin(heading_error)) / dist_to_lookahead
+    else:
+        ang_vel = 0.0
+    
+    if lin_vel > cfg.minVelForTurning:
+        max_ang_vel = lin_vel / cfg.minTurnRadius
+    else:
+        max_ang_vel = 0.0
+        ang_vel = 0.0
+    
+    ang_vel = np.clip(ang_vel, -max_ang_vel, max_ang_vel)
+    lin_vel = np.clip(lin_vel, 0.0, cfg.maxLinVel)
+    
+    return lin_vel, ang_vel
+
+# === COLLISION AVOIDANCE ===
+
+def is_reverse_path_clear(my_pose: np.ndarray, other_robots: Dict[str, RobotState], cfg: Config, map_size: np.ndarray, reverse_dist: float = 0.4) -> bool:
+    reverse_heading = my_pose[2] + np.pi
+    
+    num_checks = 8
+    for i in range(1, num_checks + 1):
+        t = (i / num_checks) * reverse_dist
+        check_x = my_pose[0] + t * np.cos(reverse_heading)
+        check_y = my_pose[1] + t * np.sin(reverse_heading)
+        check_pose = np.array([check_x, check_y, my_pose[2]])
+        
+        if check_x < cfg.mapBoundaryMargin or check_x > map_size[0] - cfg.mapBoundaryMargin:
+            return False
+        if check_y < cfg.mapBoundaryMargin or check_y > map_size[1] - cfg.mapBoundaryMargin:
+            return False
+        
+        for other_robot in other_robots.values():
+            if not other_robot.valid:
+                continue
+            
+            if check_any_collision(check_pose, other_robot.pose, cfg):
+                return False
+            
+            dist = np.sqrt((check_x - other_robot.pose[0])**2 + (check_y - other_robot.pose[1])**2)
+            if dist < cfg.safetyDistance:
+                return False
+    
+    return True
+
+def check_trajectory_collision(my_pose: np.ndarray, my_vel: float, other_pose: np.ndarray, other_vel: np.ndarray, cfg: Config, time_horizon: float = 2.0, num_checks: int = 10) -> bool:
+    for i in range(1, num_checks + 1):
+        t = (i / num_checks) * time_horizon
+        
+        my_future_x = my_pose[0] + my_vel * np.cos(my_pose[2]) * t
+        my_future_y = my_pose[1] + my_vel * np.sin(my_pose[2]) * t
+        my_future_pose = np.array([my_future_x, my_future_y, my_pose[2]])
+        
+        other_future_x = other_pose[0] + other_vel[0] * t
+        other_future_y = other_pose[1] + other_vel[1] * t
+        other_future_pose = np.array([other_future_x, other_future_y, other_pose[2]])
+        
+        if check_any_collision(my_future_pose, other_future_pose, cfg):
+            return True
+        
+        dist = np.sqrt((my_future_x - other_future_x)**2 + (my_future_y - other_future_y)**2)
+        if dist < cfg.safetyDistance:
+            return True
+    
+    return False
+
+def negotiate_velocity(my_robot: MyRobotState, other_robots: Dict[str, RobotState], cfg: Config, v_ideal: float, sim_time: float) -> Tuple[float, str, float]:
+    my_pose = my_robot.pose
+    
+    time_since_decision = sim_time - my_robot.decisionTime
+    if my_robot.reverseDecision is not None and time_since_decision < cfg.commitmentTime:
+        if my_robot.reverseDecision == 'reverse':
+            reverse_dist = np.linalg.norm(my_robot.pose[:2] - my_robot.reverseStartPos)
+            if reverse_dist >= my_robot.reverseTargetDistance:
+                my_robot.reverseDecision = None
+                return 0.0, 'wait', 0.0
+            else:
+                return -cfg.reverseVel, 'reverse', my_robot.reverseTargetDistance
+        elif my_robot.reverseDecision == 'forward':
+            return v_ideal * 0.6, 'forward', 0.0
+        else:
+            return 0.0, 'wait', 0.0
+    
+    my_robot.reverseDecision = None
+    
+    conflicts = []
+    
+    for rid, other_robot in other_robots.items():
+        if not other_robot.valid:
+            continue
+        
+        other_pose = other_robot.pose
+        curr_dist = np.sqrt((my_pose[0] - other_pose[0])**2 + (my_pose[1] - other_pose[1])**2)
+        
+        if check_any_collision(my_pose, other_pose, cfg):
+            return 0.0, 'wait', 0.0
+        
+        if curr_dist < cfg.safetyDistance:
+            return 0.0, 'wait', 0.0
+        
+        if curr_dist < cfg.decisionDistance:
+            conflicts.append({
+                'rid': rid,
+                'robot': other_robot,
+                'distance': curr_dist
+            })
+    
+    if not conflicts:
+        return v_ideal, 'forward', 0.0
+    
+    conflicts.sort(key=lambda x: x['distance'])
+    
+    critical_conflict = None
+    for conflict in conflicts:
+        will_collide = check_trajectory_collision(
+            my_pose, v_ideal, conflict['robot'].pose, conflict['robot'].velocity,
+            cfg, cfg.coordinationHorizon
+        )
+        
+        if will_collide or conflict['distance'] < cfg.emergencyDistance:
+            critical_conflict = conflict
+            break
+    
+    if critical_conflict is None:
+        return v_ideal * 0.7, 'forward', 0.0
+    
+    other_robot = critical_conflict['robot']
+    other_speed = np.linalg.norm(other_robot.velocity)
+    
+    if other_speed < 0.05:
+        return v_ideal * 0.3, 'forward', 0.0
+    
+    # Simple decision: wait if close, otherwise try reverse if path is clear
+    if critical_conflict['distance'] < cfg.emergencyDistance + 0.1:
+        return 0.0, 'wait', 0.0
+    
+    if is_reverse_path_clear(my_pose, other_robots, cfg, cfg.mapSize, 0.3):
+        estimated_reverse_dist = max(0.3, cfg.safetyDistance - critical_conflict['distance'] + 0.2)
+        estimated_reverse_dist = min(estimated_reverse_dist, cfg.maxReverseDistance)
+        
+        my_robot.reverseDecision = 'reverse'
+        my_robot.decisionTime = sim_time
+        my_robot.reverseTargetDistance = estimated_reverse_dist
+        my_robot.reverseStartPos = my_robot.pose[:2].copy()
+        
+        return -cfg.reverseVel, 'reverse', estimated_reverse_dist
+    else:
+        my_robot.reverseDecision = 'wait'
+        my_robot.decisionTime = sim_time
+        return 0.0, 'wait', 0.0
+
+# === ROBOT CONTROLLER CLASS ===
+
+class RobotController:
+    def __init__(self, robot_id: str, cfg: Config):
+        self.robot_id = robot_id
+        self.cfg = cfg
+        
+        # Robot state
+        self.my_robot = MyRobotState(robot_id)
+        self.other_robots: Dict[str, RobotState] = {}
+        
+        # Command state
+        self.current_command = "WAIT"
+        self.command_lock = threading.Lock()
+        
+        # MQTT
+        self.mqtt_client = None
+        
+        # TCP
+        self.tcp_socket = None
+        
+        # Path planner
+        self.planner = AStarPlanner(cfg.mapSize, cfg.gridResolution, cfg)
+        
+        # Timing
+        self.sim_time = 0.0
+        self.running = False
+        
+        print(f"Robot Controller initialized for {robot_id}")
+        print(f"  Min Turn Radius: {cfg.minTurnRadius:.3f}m")
+        print(f"  Robot Size: {cfg.robotLength:.2f}m x {cfg.robotWidth:.2f}m")
+        print(f"  Clearance Radius: {cfg.robotClearanceRadius:.3f}m")
+    
+    def setup_mqtt(self):
+        """Setup MQTT connection and subscriptions."""
+        # Use callback API version 2 to avoid deprecation warning
+        self.mqtt_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        self.mqtt_client.on_connect = self.on_mqtt_connect
+        self.mqtt_client.on_message = self.on_mqtt_message
+        
+        print(f"Connecting to MQTT broker: {self.cfg.mqttBroker}:{self.cfg.mqttPort}")
+        try:
+            self.mqtt_client.connect(self.cfg.mqttBroker, self.cfg.mqttPort, 60)
+            self.mqtt_client.loop_start()
+            print("MQTT connection successful")
+        except Exception as e:
+            print(f"WARNING: Could not connect to MQTT broker: {e}")
+            print("This is expected if you're not on the lab network.")
+            raise
+    
+    def on_mqtt_connect(self, client, userdata, flags, rc):
+        print(f"Connected to MQTT broker with result code {rc}")
+        
+        # Subscribe to my position
+        my_topic = f"rb/{self.robot_id}"
+        client.subscribe(my_topic)
+        print(f"  Subscribed to: {my_topic}")
+        
+        # Subscribe to all other robot positions (assuming robot IDs from 001 to 999)
+        for i in range(1, 100):  # Adjust range as needed
+            other_id = f"limo{i:03d}"
+            if other_id != self.robot_id:
+                other_topic = f"rb/{other_id}"
+                client.subscribe(other_topic)
+        print(f"  Subscribed to all rb/limoXXX topics")
+        
+        # Subscribe to goal
+        goal_topic = f"goal/{self.robot_id}"
+        client.subscribe(goal_topic)
+        print(f"  Subscribed to: {goal_topic}")
+        
+        # Subscribe to commands
+        cmd_topic = f"cmd/{self.robot_id}"
+        client.subscribe(cmd_topic)
+        print(f"  Subscribed to: {cmd_topic}")
+    
+    def on_mqtt_message(self, client, userdata, msg):
+        """Handle incoming MQTT messages."""
+        topic = msg.topic
+        
+        try:
+            if topic.startswith("rb/"):
+                # Robot position update
+                self.handle_position_update(topic, msg.payload)
+            elif topic.startswith("goal/"):
+                # Goal update
+                self.handle_goal_update(msg.payload)
+            elif topic.startswith("cmd/"):
+                # Command update
+                self.handle_command_update(msg.payload)
+        except Exception as e:
+            print(f"Error processing message on {topic}: {e}")
+    
+    def handle_position_update(self, topic: str, payload: bytes):
+        """Process robot position updates from MoCap."""
+        try:
+            data = json.loads(payload.decode('utf-8'))
+            
+            if 'pos' not in data or 'rot' not in data:
+                return
+            
+            # Transform MoCap coordinates to map frame
+            mocap_x = data['pos'][0]
+            mocap_y = data['pos'][2]  # Y is the 3rd element
+            x = mocap_x - self.cfg.mocapOriginX
+            y = -(mocap_y - self.cfg.mocapOriginY)
+            
+            # Extract robot ID from topic
+            robot_id = topic.split('/')[-1]
+            
+            if robot_id == self.robot_id:
+                # My position
+                current_time = time.time()
+                
+                # Calculate heading from velocity if moving
+                if self.my_robot.prevPose is not None and self.my_robot.prevTime is not None:
+                    dt = current_time - self.my_robot.prevTime
+                    if dt > 0:
+                        dx = x - self.my_robot.prevPose[0]
+                        dy = y - self.my_robot.prevPose[1]
+                        speed = np.sqrt(dx**2 + dy**2) / dt
+                        
+                        if speed > 0.05:
+                            theta = np.arctan2(dy, dx)
+                        else:
+                            theta = self.my_robot.prevPose[2]
+                    else:
+                        theta = self.my_robot.prevPose[2]
+                else:
+                    # First reading: use raw yaw
+                    theta = -data['rot'][2] if len(data['rot']) >= 3 else 0.0
+                
+                self.my_robot.prevPose = self.my_robot.pose.copy()
+                self.my_robot.prevTime = current_time
+                self.my_robot.pose = np.array([x, y, theta])
+            else:
+                # Other robot position
+                if robot_id not in self.other_robots:
+                    self.other_robots[robot_id] = RobotState(robot_id)
+                
+                # Calculate heading from velocity if we have previous data
+                other = self.other_robots[robot_id]
+                current_time = time.time()
+                
+                if other.valid:
+                    dt = current_time - other.last_update_time
+                    if dt > 0:
+                        dx = x - other.pose[0]
+                        dy = y - other.pose[1]
+                        other.velocity = np.array([dx / dt, dy / dt])
+                        
+                        speed = np.sqrt(dx**2 + dy**2) / dt
+                        if speed > 0.05:
+                            theta = np.arctan2(dy, dx)
+                        else:
+                            theta = other.pose[2]
+                    else:
+                        theta = other.pose[2]
+                else:
+                    theta = -data['rot'][2] if len(data['rot']) >= 3 else 0.0
+                    other.velocity = np.array([0.0, 0.0])
+                
+                other.pose = np.array([x, y, theta])
+                other.last_update_time = current_time
+                other.valid = True
+                
+        except Exception as e:
+            print(f"Error parsing position update: {e}")
+    
+    def handle_goal_update(self, payload: bytes):
+        """Process goal position update."""
+        try:
+            data = json.loads(payload.decode('utf-8'))
+            
+            if 'x' in data and 'y' in data:
+                goal_x = float(data['x'])
+                goal_y = float(data['y'])
+                self.my_robot.goal = np.array([goal_x, goal_y])
+                print(f"Goal updated: ({goal_x:.2f}, {goal_y:.2f})")
+                
+                # Create initial straight-line path
+                if self.my_robot.pose is not None:
+                    path_x = np.linspace(self.my_robot.pose[0], goal_x, 20)
+                    path_y = np.linspace(self.my_robot.pose[1], goal_y, 20)
+                    self.my_robot.path = Path(path_x, path_y)
+        except Exception as e:
+            print(f"Error parsing goal update: {e}")
+    
+    def handle_command_update(self, payload: bytes):
+        """Process command update."""
+        try:
+            command = payload.decode('utf-8').strip().upper()
+            
+            with self.command_lock:
+                prev_command = self.current_command
+                self.current_command = command
+            
+            print(f"Command received: {command}")
+            
+            if command == "HALT":
+                self.running = False
+                self.send_velocity(0.0, 0.0)
+                print("HALT command - stopping robot")
+        except Exception as e:
+            print(f"Error parsing command: {e}")
+    
+    def setup_tcp(self):
+        """Setup TCP connection to LIMO."""
+        limo_ip = self.cfg.limoIpPrefix + self.robot_id[-3:]
+        
+        print(f"Connecting to LIMO TCP: {limo_ip}:{self.cfg.limoTcpPort}")
+        
+        self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_socket.settimeout(5.0)
+        
+        try:
+            self.tcp_socket.connect((limo_ip, self.cfg.limoTcpPort))
+            print("TCP connection established")
+            
+            # Send initial stop command
+            self.send_velocity(0.0, 0.0)
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Error connecting to LIMO: {e}")
+            raise
+    
+    def send_velocity(self, linear: float, angular: float):
+        """Send velocity command to LIMO via TCP."""
+        if self.tcp_socket is None:
+            return
+        
+        try:
+            command = f"{linear:.2f},{angular:.2f}"
+            self.tcp_socket.sendall(command.encode('utf-8'))
+        except Exception as e:
+            print(f"Error sending velocity: {e}")
+    
+    def replan_path(self):
+        """Replan path using A* considering other robots."""
+        if self.my_robot.goal is None:
+            return False
+        
+        # Create obstacle map from other robots
+        other_robots_list = []
+        for rid, other in self.other_robots.items():
+            if other.valid:
+                other_robots_list.append({
+                    'x': other.pose[0],
+                    'y': other.pose[1],
+                    'vx': other.velocity[0],
+                    'vy': other.velocity[1]
+                })
+        
+        obstacle_map = self.planner.create_obstacle_map(other_robots_list)
+        
+        new_path = self.planner.plan(self.my_robot.pose, self.my_robot.goal, obstacle_map)
+        
+        if new_path is not None:
+            self.my_robot.path = new_path
+            self.my_robot.replanCount += 1
+            self.my_robot.stuckCounter = 0
+            return True
+        else:
+            # No path found - try reversing
+            if is_reverse_path_clear(self.my_robot.pose, self.other_robots, self.cfg, self.cfg.mapSize, 0.3):
+                self.my_robot.reverseDecision = 'reverse'
+                self.my_robot.decisionTime = self.sim_time
+                self.my_robot.reverseTargetDistance = 0.3
+                self.my_robot.reverseStartPos = self.my_robot.pose[:2].copy()
+            return False
+    
+    def control_loop(self):
+        """Main control loop."""
+        print("\nWaiting for goal and initial position...")
+        
+        # Wait for goal and valid position
+        while self.my_robot.goal is None or self.my_robot.pose[0] == 0.0:
+            time.sleep(0.1)
+            if not self.running:
+                return
+        
+        print(f"Starting control loop")
+        print(f"  Start: ({self.my_robot.pose[0]:.2f}, {self.my_robot.pose[1]:.2f})")
+        print(f"  Goal: ({self.my_robot.goal[0]:.2f}, {self.my_robot.goal[1]:.2f})")
+        
+        self.my_robot.lastPosition = self.my_robot.pose[:2].copy()
+        
+        loop_count = 0
+        start_time = time.time()
+        
+        while self.running:
+            loop_start = time.time()
+            self.sim_time = time.time() - start_time
+            
+            # Check current command
+            with self.command_lock:
+                command = self.current_command
+            
+            if command == "HALT":
+                break
+            elif command == "WAIT":
+                self.send_velocity(0.0, 0.0)
+                time.sleep(self.cfg.dt)
+                continue
+            elif command == "STOP":
+                self.send_velocity(0.0, 0.0)
+                time.sleep(self.cfg.dt)
+                continue
+            elif command != "GO":
+                # Unknown command, treat as WAIT
+                self.send_velocity(0.0, 0.0)
+                time.sleep(self.cfg.dt)
+                continue
+            
+            # Command is "GO" - proceed with navigation
+            
+            # Check if goal reached
+            dist_to_goal = np.sqrt((self.my_robot.pose[0] - self.my_robot.goal[0])**2 + 
+                                   (self.my_robot.pose[1] - self.my_robot.goal[1])**2)
+            
+            if dist_to_goal < self.cfg.posTolerance:
+                print(f"\nGoal reached at {self.sim_time:.1f}s ({self.my_robot.replanCount} replans)")
+                self.send_velocity(0.0, 0.0)
+                
+                # Wait for new command
+                with self.command_lock:
+                    self.current_command = "WAIT"
+                
+                time.sleep(self.cfg.dt)
+                continue
+            
+            # Check if stuck
+            pos_change = np.linalg.norm(self.my_robot.pose[:2] - self.my_robot.lastPosition)
+            if pos_change < 0.01:
+                self.my_robot.stuckCounter += 1
+                self.my_robot.waitingTime += self.cfg.dt
+                self.my_robot.totalWaitTime += self.cfg.dt
+            else:
+                self.my_robot.stuckCounter = 0
+                self.my_robot.waitingTime = 0.0
+                self.my_robot.inTrafficJam = False
+            
+            self.my_robot.lastPosition = self.my_robot.pose[:2].copy()
+            
+            # Mark if in traffic jam
+            if self.my_robot.waitingTime > self.cfg.trafficJamTimeout:
+                self.my_robot.inTrafficJam = True
+            
+            # Replan if needed
+            should_replan = (
+                self.my_robot.path is None or
+                (self.sim_time - self.my_robot.lastReplanTime) >= self.cfg.replanInterval or
+                self.my_robot.stuckCounter > self.cfg.stuckThreshold or
+                self.my_robot.inTrafficJam
+            )
+            
+            if should_replan:
+                self.replan_path()
+                self.my_robot.lastReplanTime = self.sim_time
+            
+            # If no path, wait
+            if self.my_robot.path is None:
+                self.send_velocity(0.0, 0.0)
+                time.sleep(self.cfg.dt)
+                continue
+            
+            # Pure pursuit control
+            lin_vel, ang_vel = pure_pursuit_control(self.my_robot, self.cfg)
+            
+            # Collision avoidance
+            v_cmd, decision, target_reverse_dist = negotiate_velocity(
+                self.my_robot, self.other_robots, self.cfg, lin_vel, self.sim_time
+            )
+            
+            # Execute decision
+            if decision == 'reverse':
+                lin_vel = -self.cfg.reverseVel
+                ang_vel = 0.0
+                
+                # Safety check while reversing
+                if not is_reverse_path_clear(self.my_robot.pose, self.other_robots, 
+                                            self.cfg, self.cfg.mapSize, 
+                                            self.cfg.reverseVel * self.cfg.dt * 2):
+                    self.my_robot.reverseDecision = None
+                    lin_vel = 0.0
+            elif decision == 'wait':
+                lin_vel = 0.0
+                ang_vel = 0.0
+            else:  # 'forward'
+                lin_vel = v_cmd
+            
+            # Car-like constraint: Can only turn when moving
+            if abs(lin_vel) < self.cfg.minVelForTurning:
+                ang_vel = 0.0
+            
+            # Apply velocity limits
+            lin_vel = np.clip(lin_vel, -self.cfg.maxLinVel, self.cfg.maxLinVel)
+            ang_vel = np.clip(ang_vel, -self.cfg.maxAngVel, self.cfg.maxAngVel)
+            
+            # Send velocity command
+            self.send_velocity(lin_vel, ang_vel)
+            
+            # Status update every 30 loops (1 second)
+            if loop_count % 30 == 0:
+                print(f"[{self.sim_time:.1f}s] Pos:({self.my_robot.pose[0]:.2f},{self.my_robot.pose[1]:.2f}) "
+                      f"Goal:{dist_to_goal:.2f}m V:{lin_vel:.2f} W:{np.rad2deg(ang_vel):.1f}° "
+                      f"Decision:{decision} Replans:{self.my_robot.replanCount}")
+            
+            loop_count += 1
+            
+            # Maintain control loop rate
+            elapsed = time.time() - loop_start
+            if elapsed < self.cfg.dt:
+                time.sleep(self.cfg.dt - elapsed)
+        
+        # Cleanup
+        self.send_velocity(0.0, 0.0)
+        print("\nControl loop ended")
+    
+    def run(self):
+        """Start the robot controller."""
+        try:
+            self.running = True
+            
+            # Setup connections
+            self.setup_mqtt()
+            time.sleep(2)  # Wait for MQTT to establish
+            
+            self.setup_tcp()
+            
+            print("\nRobot controller ready")
+            print("Waiting for commands on cmd/{}".format(self.robot_id))
+            
+            # Run control loop
+            self.control_loop()
+            
+        except KeyboardInterrupt:
+            print("\nKeyboard interrupt received")
+        except Exception as e:
+            print(f"\nError in main loop: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Cleanup resources."""
+        print("\nCleaning up...")
+        
+        self.running = False
+        
+        # Stop robot
+        if self.tcp_socket:
+            try:
+                self.send_velocity(0.0, 0.0)
+                time.sleep(0.5)
+                self.tcp_socket.close()
+            except:
+                pass
+        
+        # Stop MQTT
+        if self.mqtt_client:
+            try:
+                self.mqtt_client.loop_stop()
+                self.mqtt_client.disconnect()
+            except:
+                pass
+        
+        print("Cleanup complete")
+
+# === MAIN ===
+
+def main():
+    """Main entry point."""
+    print("=" * 60)
+    print("Physical Robot Navigation Controller")
+    print("=" * 60)
+    print("\nNOTE: This script requires connection to the lab network")
+    print("      with access to:")
+    print("      - MQTT broker: rasticvm.lan:1883")
+    print("      - LIMO robot: 192.168.1.XXX:12345")
+    print("      - Motion capture system publishing to rb/limoXXX")
+    print()
+    
+    # Get robot ID
+    robot_id = input("Enter robot ID (e.g., limo101): ").strip()
+    
+    if not robot_id:
+        print("Error: Robot ID cannot be empty")
+        return
+    
+    print(f"\nInitializing controller for {robot_id}...")
+    
+    # Create configuration
+    cfg = Config()
+    
+    # Create and run controller
+    controller = RobotController(robot_id, cfg)
+    controller.run()
+
+if __name__ == '__main__':
+    main()
