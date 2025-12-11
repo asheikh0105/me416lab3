@@ -31,7 +31,7 @@ MAX_LINEAR_ACCEL = 0.8
 WHEELBASE = 0.35         # distance between front and rear axles (m)
 MAX_STEER = np.radians(35)   # max steering angle (rad)
 MAX_STEER_RATE = np.radians(45)  # max steering rate (rad/s)
-REVERSE_THRESHOLD = np.radians(100)  # Start reversing if heading error > 120 degrees
+REVERSE_THRESHOLD = np.radians(100)  # Start reversing if heading error > 100 degrees (lowered from 120)
 
 # Replanning parameters
 REPLAN_DIST = 2.0
@@ -179,6 +179,13 @@ class Robot:
 
         # Bicycle model state
         self.theta = np.random.uniform(0, 2*np.pi)  # heading angle
+        
+        # Initialize facing somewhat toward goal to help with startup
+        to_goal = self.goal - self.position
+        goal_angle = np.arctan2(to_goal[1], to_goal[0])
+        angle_offset = np.random.uniform(-np.pi/3, np.pi/3)  # +/- 60 degrees
+        self.theta = goal_angle + angle_offset
+        
         self.linear_vel = 0.0  # forward velocity (can be negative for reverse)
         self.delta = 0.0  # steering angle
         self.is_reversing = False  # track if currently in reverse
@@ -312,11 +319,12 @@ class Robot:
             reverse_heading_error = np.arctan2(np.sin(desired_angle - self.theta + np.pi),
                                                np.cos(desired_angle - self.theta + np.pi))
             
-            kp_steer = 2.0  # Gentler steering in reverse
+            # More aggressive steering in reverse to turn around quickly
+            kp_steer = 3.5  # Increased from 2.0 for faster turning
             target_delta = np.clip(kp_steer * reverse_heading_error, -MAX_STEER, MAX_STEER)
             
-            # Slower speed in reverse
-            target_v = -min(desired_speed * 0.5, MAX_REVERSE_VEL)
+            # Faster reverse speed to complete the maneuver quickly
+            target_v = -min(desired_speed * 0.8, MAX_REVERSE_VEL)  # Increased from 0.5 to 0.8
             
         else:
             # Normal forward driving
@@ -351,7 +359,7 @@ class Robot:
 
     def update_bicycle_kinematics(self):
         """
-        Update position and orientation using bicycle model:
+        Update position and orientation using bicycle/Ackermann model:
         x_dot = v * cos(theta)
         y_dot = v * sin(theta)
         theta_dot = (v / L) * tan(delta)
@@ -425,8 +433,7 @@ fig, ax = plt.subplots(figsize=(9, 8))
 ax.set_xlim(-WORLD_SIZE, WORLD_SIZE)
 ax.set_ylim(-WORLD_SIZE, WORLD_SIZE)
 ax.set_aspect("equal")
-# A* planning with bicycle kinematics
-ax.set_title("Multi-Robot Dynamic Obstacle Avoidance Simulation", fontsize=14, fontweight='bold')
+ax.set_title("Multi-Robot Dynamic Obstacle Avoidance Simulator", fontsize=14, fontweight='bold')
 
 status_text = ax.text(
     0.02, 0.98, "",
@@ -461,7 +468,7 @@ replan_plots = [
     for i in range(N_AGENTS)
 ]
 
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Patch
 arrows = []
 detection_circles = []
 
