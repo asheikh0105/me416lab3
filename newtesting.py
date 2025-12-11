@@ -31,7 +31,7 @@ MAX_LINEAR_ACCEL = 0.8
 WHEELBASE = 0.35         # distance between front and rear axles (m)
 MAX_STEER = np.radians(35)   # max steering angle (rad)
 MAX_STEER_RATE = np.radians(45)  # max steering rate (rad/s)
-REVERSE_THRESHOLD = np.radians(120)  # Start reversing if heading error > 120 degrees
+REVERSE_THRESHOLD = np.radians(100)  # Start reversing if heading error > 120 degrees
 
 # Replanning parameters
 REPLAN_DIST = 2.0
