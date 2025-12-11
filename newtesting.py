@@ -38,6 +38,11 @@ REPLAN_DIST = 2.0
 REPLAN_COOLDOWN = 1.0
 OBSTACLE_INFLATION = ROBOT_RADIUS * 2.0
 
+# Boundary margin for spawn/goal placement
+BOUNDARY_MARGIN = 1.5  # Keep positions at least 1.5m from edges
+MIN_SPAWN_SEPARATION = 1.0  # Minimum distance between robot spawns
+MIN_GOAL_SEPARATION = 1.0  # Minimum distance between goals
+
 goal_markers = []
 
 # -------------------------------------------------------
@@ -132,15 +137,45 @@ def astar_with_obstacles(start, goal, obstacle_grid, grid_min, grid_max):
 
 
 # -------------------------------------------------------
+# Helper functions for collision-free placement
+# -------------------------------------------------------
+def generate_safe_position(existing_positions, min_separation, spawn_min, spawn_max, max_attempts=100):
+    """Generate a position that doesn't overlap with existing positions"""
+    for _ in range(max_attempts):
+        pos = np.random.uniform(spawn_min, spawn_max, size=2)
+        
+        # Check if far enough from all existing positions
+        if len(existing_positions) == 0:
+            return pos
+        
+        distances = [np.linalg.norm(pos - existing) for existing in existing_positions]
+        if min(distances) >= min_separation:
+            return pos
+    
+    # If we couldn't find a good spot after max_attempts, just return the last attempt
+    return pos
+
+
+# -------------------------------------------------------
 # Agent Class with Bicycle Kinematics
 # -------------------------------------------------------
 class Robot:
-    def __init__(self, idx, color):
+    def __init__(self, idx, color, existing_spawns, existing_goals):
         self.idx = idx
         self.color = color
-        self.position = np.random.uniform(-WORLD_SIZE, WORLD_SIZE, size=2)
+        
+        # Spawn position away from boundaries and other robots
+        spawn_min = -WORLD_SIZE + BOUNDARY_MARGIN
+        spawn_max = WORLD_SIZE - BOUNDARY_MARGIN
+        self.position = generate_safe_position(
+            existing_spawns, MIN_SPAWN_SEPARATION, spawn_min, spawn_max
+        )
         self.trail = [ self.position.copy() ]
-        self.goal = np.random.uniform(-WORLD_SIZE, WORLD_SIZE, size=2)
+        
+        # Goal position away from boundaries and other goals
+        self.goal = generate_safe_position(
+            existing_goals, MIN_GOAL_SEPARATION, spawn_min, spawn_max
+        )
 
         # Bicycle model state
         self.theta = np.random.uniform(0, 2*np.pi)  # heading angle
@@ -316,7 +351,7 @@ class Robot:
 
     def update_bicycle_kinematics(self):
         """
-        Update position and orientation using bicycle/Ackermann model:
+        Update position and orientation using bicycle model:
         x_dot = v * cos(theta)
         y_dot = v * sin(theta)
         theta_dot = (v / L) * tan(delta)
@@ -366,10 +401,22 @@ class Robot:
 
 
 # -------------------------------------------------------
-# Create agents
+# Create agents with collision-free placement
 # -------------------------------------------------------
-agents = [Robot(i, color=ROBOT_COLORS[i % len(ROBOT_COLORS)]) 
-          for i in range(N_AGENTS)]
+agents = []
+existing_spawns = []
+existing_goals = []
+
+for i in range(N_AGENTS):
+    agent = Robot(
+        i, 
+        color=ROBOT_COLORS[i % len(ROBOT_COLORS)],
+        existing_spawns=existing_spawns,
+        existing_goals=existing_goals
+    )
+    agents.append(agent)
+    existing_spawns.append(agent.position.copy())
+    existing_goals.append(agent.goal.copy())
 
 # -------------------------------------------------------
 # Visualization Setup
@@ -378,7 +425,8 @@ fig, ax = plt.subplots(figsize=(9, 8))
 ax.set_xlim(-WORLD_SIZE, WORLD_SIZE)
 ax.set_ylim(-WORLD_SIZE, WORLD_SIZE)
 ax.set_aspect("equal")
-ax.set_title("Multi-Robot A* with Bicycle/Ackermann Kinematics", fontsize=14, fontweight='bold')
+# A* planning with bicycle kinematics
+ax.set_title("Multi-Robot Dynamic Obstacle Avoidance Simulation", fontsize=14, fontweight='bold')
 
 status_text = ax.text(
     0.02, 0.98, "",
@@ -417,7 +465,6 @@ from matplotlib.patches import Circle
 arrows = []
 detection_circles = []
 
-ax.legend(loc='upper right')
 ax.grid(True, alpha=0.3)
 
 def init():
