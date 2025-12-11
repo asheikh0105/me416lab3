@@ -20,6 +20,9 @@ AVOID_GAIN = 2.5
 GOAL_TOL = 0.3
 WAYPOINT_TOL = 0.4
 GRID_RES = 1.0
+ROBOT_COLORS = [
+    "blue", "red", "green", "purple", "orange", "brown", 
+    "pink", "olive", "cyan", "magenta", "yellow", "darkblue"]
 
 # Dynamics parameters
 MAX_LINEAR_VEL = 1.2
@@ -31,6 +34,9 @@ MAX_ANGULAR_ACCEL = 3.0
 REPLAN_DIST = 2.0  # Replan if obstacle within this distance
 REPLAN_COOLDOWN = 1.0  # Minimum time between replans (seconds)
 OBSTACLE_INFLATION = ROBOT_RADIUS * 2.0  # about 0.5 m
+
+
+goal_markers = []
 
 # -------------------------------------------------------
 # A* PATH PLANNING with Obstacle Grid
@@ -130,8 +136,9 @@ def astar_with_obstacles(start, goal, obstacle_grid, grid_min, grid_max):
 # Agent Class with Dynamic Replanning
 # -------------------------------------------------------
 class Robot:
-    def __init__(self, idx):
+    def __init__(self, idx, color):
         self.idx = idx
+        self.color = color
         self.position = np.random.uniform(-WORLD_SIZE, WORLD_SIZE, size=2)
         self.goal = np.random.uniform(-WORLD_SIZE, WORLD_SIZE, size=2)
         
@@ -317,7 +324,8 @@ class Robot:
 # -------------------------------------------------------
 # Create agents
 # -------------------------------------------------------
-agents = [Robot(i) for i in range(N_AGENTS)]
+agents = [Robot(i, color=ROBOT_COLORS[i % len(ROBOT_COLORS)]) 
+          for i in range(N_AGENTS)]
 
 # -------------------------------------------------------
 # Visualization Setup
@@ -340,10 +348,23 @@ status_text = ax.text(
 
 points, = ax.plot([], [], "bo", markersize=10, label="Robots")
 goals, = ax.plot([], [], "rx", markersize=10, markeredgewidth=2, label="Goals")
-paths_plots = [ax.plot([], [], "g--", linewidth=1.5, alpha=0.4)[0] for _ in agents]
+paths_plots = [
+    ax.plot([], [], linestyle="--", linewidth=1.5, alpha=0.4, 
+            color=agents[i].color)[0]
+    for i in range(N_AGENTS)
+]
 
-# Add replanning indicator (yellow path for robots currently replanning)
-replan_plots = [ax.plot([], [], "y-", linewidth=3, alpha=0.8)[0] for _ in agents]
+# Add replanning indicator (same color path for robots currently replanning)
+replan_plots = [
+    ax.plot(
+        [], [], 
+        linestyle="-", 
+        linewidth=3, 
+        alpha=0.9,
+        color=agents[i].color        # << match robot color
+    )[0]
+    for i in range(N_AGENTS)
+]
 
 # Arrow patches to show robot orientation
 from matplotlib.patches import FancyArrow, Circle
@@ -355,7 +376,26 @@ ax.grid(True, alpha=0.3)
 
 def init():
     status_text.set_text("")
-    return [points, goals, status_text] + paths_plots + replan_plots
+    points.set_data([], [])
+
+    # Clear goal markers in case animation restarts
+    goal_markers.clear()
+
+    # Create persistent goal markers colored per robot
+    for agent in agents:
+        gm, = ax.plot(
+            agent.goal[0], agent.goal[1],
+            marker='x',
+            markersize=12,
+            markeredgewidth=2,
+            linestyle='None',
+            color=agent.color
+        )
+        goal_markers.append(gm)
+
+    return [points, goals, status_text] + goal_markers + paths_plots + replan_plots
+
+
 
 # -------------------------------------------------------
 # Animation update
@@ -377,7 +417,7 @@ def update(frame):
     
     status_text.set_text(
         f"Reached: {reached_count}/{N_AGENTS}\n"
-        f"Frame: {frame}\n"
+        # f"Frame: {frame}\n"
         f"Total Replans: {total_replans}"
     )
     
@@ -389,7 +429,6 @@ def update(frame):
     gx = [a.goal[0] for a in agents]
     gy = [a.goal[1] for a in agents]
     
-    goals.set_data(gx, gy)
     
     # Clear old arrows and detection circles
     for arrow in arrows:
@@ -401,7 +440,12 @@ def update(frame):
     
     # Draw rectangles (robots)
     for agent in agents:
-        color = 'green' if agent.reached else ('orange' if agent.is_replanning else 'darkblue')
+        if agent.reached:
+            color = agent.color
+        elif agent.is_replanning:
+            color = "yellow"
+        else:
+            color = agent.color
 
         rect = Rectangle(
             (agent.position[0] - ROBOT_LENGTH/2, agent.position[1] - ROBOT_WIDTH/2),
@@ -434,7 +478,7 @@ def update(frame):
         else:
             pl.set_data([], [])
     
-    # Highlight paths that were just replanned (yellow)
+    # Highlight paths that were just replanned
     for rpl, agent in zip(replan_plots, agents):
         if agent.time_since_replan < 0.5:  # Show for 0.5 seconds after replan
             pts = np.array(agent.path)
@@ -442,7 +486,7 @@ def update(frame):
         else:
             rpl.set_data([], [])
     
-    return [points, goals, status_text] + paths_plots + replan_plots + rectangles + detection_circles
+    return [points, goals, status_text] + paths_plots + replan_plots + rectangles + detection_circles + goal_markers
 
 
 
