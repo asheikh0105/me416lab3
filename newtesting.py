@@ -17,24 +17,26 @@ ROBOT_HALF_DIAG = np.sqrt(ROBOT_WIDTH**2 + ROBOT_LENGTH**2) / 2
 ROBOT_RADIUS = ROBOT_HALF_DIAG   # ~0.25 m
 AVOID_DIST = ROBOT_RADIUS * 4.0          # ~1.0 m
 AVOID_GAIN = 2.5
-GOAL_TOL = 0.3
-WAYPOINT_TOL = 0.4
+GOAL_TOL = 0.5  # Increased tolerance to help with parking
+WAYPOINT_TOL = 0.6
 GRID_RES = 1.0
 ROBOT_COLORS = [
     "blue", "red", "green", "purple", "orange", "brown", 
     "pink", "olive", "cyan", "magenta", "yellow", "darkblue"]
 
-# Dynamics parameters
+# Bicycle/Ackermann dynamics parameters
 MAX_LINEAR_VEL = 1.2
-MAX_ANGULAR_VEL = 2.0
+MAX_REVERSE_VEL = 0.6  # Slower in reverse
 MAX_LINEAR_ACCEL = 0.8
-MAX_ANGULAR_ACCEL = 3.0
+WHEELBASE = 0.35         # distance between front and rear axles (m)
+MAX_STEER = np.radians(35)   # max steering angle (rad)
+MAX_STEER_RATE = np.radians(45)  # max steering rate (rad/s)
+REVERSE_THRESHOLD = np.radians(120)  # Start reversing if heading error > 120 degrees
 
-# NEW: Replanning parameters
-REPLAN_DIST = 2.0  # Replan if obstacle within this distance
-REPLAN_COOLDOWN = 1.0  # Minimum time between replans (seconds)
-OBSTACLE_INFLATION = ROBOT_RADIUS * 2.0  # about 0.5 m
-
+# Replanning parameters
+REPLAN_DIST = 2.0
+REPLAN_COOLDOWN = 1.0
+OBSTACLE_INFLATION = ROBOT_RADIUS * 2.0
 
 goal_markers = []
 
@@ -112,11 +114,9 @@ def astar_with_obstacles(start, goal, obstacle_grid, grid_min, grid_max):
         for dx, dy in nbrs:
             nbr = (current[0] + dx, current[1] + dy)
 
-            # Check bounds
             if not (0 <= nbr[0] < grid_w and 0 <= nbr[1] < grid_h):
                 continue
             
-            # Check if obstacle
             if obstacle_grid[nbr[0], nbr[1]]:
                 continue
 
@@ -128,12 +128,11 @@ def astar_with_obstacles(start, goal, obstacle_grid, grid_min, grid_max):
                 heapq.heappush(open_set, (f, nbr))
                 came_from[nbr] = current
 
-    # No path found - return straight line as fallback
     return [start, goal]
 
 
 # -------------------------------------------------------
-# Agent Class with Dynamic Replanning
+# Agent Class with Bicycle Kinematics
 # -------------------------------------------------------
 class Robot:
     def __init__(self, idx, color):
@@ -142,15 +141,16 @@ class Robot:
         self.position = np.random.uniform(-WORLD_SIZE, WORLD_SIZE, size=2)
         self.trail = [ self.position.copy() ]
         self.goal = np.random.uniform(-WORLD_SIZE, WORLD_SIZE, size=2)
-        
-        # Non-holonomic state
-        self.theta = np.random.uniform(0, 2*np.pi)
-        self.linear_vel = 0.0
-        self.angular_vel = 0.0
+
+        # Bicycle model state
+        self.theta = np.random.uniform(0, 2*np.pi)  # heading angle
+        self.linear_vel = 0.0  # forward velocity (can be negative for reverse)
+        self.delta = 0.0  # steering angle
+        self.is_reversing = False  # track if currently in reverse
         
         self.reached = False
         
-        # Initial path (no obstacles known yet)
+        # Initial path
         obstacle_grid = np.zeros((int(2*WORLD_SIZE/GRID_RES), 
                                  int(2*WORLD_SIZE/GRID_RES)), dtype=bool)
         self.path = astar_with_obstacles(
@@ -169,7 +169,6 @@ class Robot:
         if self.path_i >= len(self.path):
             return False
         
-        # Look ahead several waypoints
         lookahead = min(3, len(self.path) - self.path_i)
         
         for i in range(lookahead):
@@ -179,7 +178,6 @@ class Robot:
             
             waypoint = self.path[wp_idx]
             
-            # Check if any other robot is near this waypoint
             for other in agents:
                 if other.idx == self.idx:
                     continue
@@ -194,13 +192,11 @@ class Robot:
         """Recompute A* path avoiding current obstacle positions"""
         self.is_replanning = True
         
-        # Create obstacle grid from other robot positions
         obstacle_grid = create_obstacle_grid(
             agents, self.idx, 
             grid_min=-WORLD_SIZE, grid_max=+WORLD_SIZE
         )
         
-        # Replan from current position to goal
         new_path = astar_with_obstacles(
             self.position, self.goal, obstacle_grid,
             grid_min=-WORLD_SIZE, grid_max=+WORLD_SIZE
@@ -241,52 +237,110 @@ class Robot:
                 continue
             diff = self.position - other.position
             center_dist = np.linalg.norm(diff)
-            min_safe = ROBOT_HALF_DIAG * 2.0  # safe edge-to-edge clearance
+            min_safe = ROBOT_HALF_DIAG * 2.0
 
             if center_dist < min_safe + AVOID_DIST:
                 overlap = (min_safe + AVOID_DIST) - center_dist
                 repulse = (diff / center_dist) * (AVOID_GAIN * overlap)
                 desired_dir += repulse
-
         
         norm = np.linalg.norm(desired_dir)
         if norm > 1e-6:
             desired_dir = desired_dir / norm
         
         desired_angle = np.arctan2(desired_dir[1], desired_dir[0])
-        desired_speed = min(ROBOT_SPEED, dist_to_wp * 2)
+        
+        # Reduce speed dramatically when close to goal to help with parking
+        if dist_to_wp < 1.5:
+            desired_speed = max(0.3, dist_to_wp * 0.4)  # Minimum speed to keep moving
+        else:
+            desired_speed = min(ROBOT_SPEED, dist_to_wp * 2)
         
         return desired_angle, desired_speed
 
-    def differential_drive_control(self, desired_angle, desired_speed):
-        """Convert desired direction to differential drive commands"""
-        angle_error = desired_angle - self.theta
-        angle_error = np.arctan2(np.sin(angle_error), np.cos(angle_error))
+    def bicycle_control(self, desired_angle, desired_speed):
+        """
+        Pure pursuit style control for bicycle model with reverse capability.
+        Returns: (target_velocity, target_steering_angle)
+        """
+        # Compute heading error
+        heading_error = np.arctan2(np.sin(desired_angle - self.theta),
+                                    np.cos(desired_angle - self.theta))
         
-        desired_angular_vel = np.clip(3.0 * angle_error, -MAX_ANGULAR_VEL, MAX_ANGULAR_VEL)
+        # Decide whether to go forward or reverse
+        should_reverse = abs(heading_error) > REVERSE_THRESHOLD
         
-        turn_penalty = 1.0 - (abs(angle_error) / np.pi)
-        desired_linear_vel = desired_speed * turn_penalty
-        desired_linear_vel = np.clip(desired_linear_vel, 0, MAX_LINEAR_VEL)
+        if should_reverse:
+            # Going in reverse - flip the heading error and use negative velocity
+            self.is_reversing = True
+            # When reversing, we want to steer away from the goal to turn around
+            reverse_heading_error = np.arctan2(np.sin(desired_angle - self.theta + np.pi),
+                                               np.cos(desired_angle - self.theta + np.pi))
+            
+            kp_steer = 2.0  # Gentler steering in reverse
+            target_delta = np.clip(kp_steer * reverse_heading_error, -MAX_STEER, MAX_STEER)
+            
+            # Slower speed in reverse
+            target_v = -min(desired_speed * 0.5, MAX_REVERSE_VEL)
+            
+        else:
+            # Normal forward driving
+            self.is_reversing = False
+            
+            # Proportional steering control
+            kp_steer = 2.5
+            target_delta = np.clip(kp_steer * heading_error, -MAX_STEER, MAX_STEER)
+            
+            # Reduce speed when making sharp turns
+            turn_factor = abs(target_delta) / MAX_STEER
+            speed_reduction = 1.0 - 0.6 * turn_factor
+            target_v = min(desired_speed, MAX_LINEAR_VEL) * speed_reduction
         
-        return desired_linear_vel, desired_angular_vel
+        return target_v, target_delta
 
-    def apply_acceleration_limits(self, target_linear, target_angular):
-        """Apply acceleration constraints"""
-        linear_accel = (target_linear - self.linear_vel) / DT
-        linear_accel = np.clip(linear_accel, -MAX_LINEAR_ACCEL, MAX_LINEAR_ACCEL)
-        self.linear_vel += linear_accel * DT
-        self.linear_vel = np.clip(self.linear_vel, 0, MAX_LINEAR_VEL)
+    def apply_control_limits(self, target_vel, target_delta):
+        """Apply velocity and steering rate limits"""
+        # Limit linear acceleration (works for both forward and reverse)
+        vel_change = target_vel - self.linear_vel
+        max_vel_change = MAX_LINEAR_ACCEL * DT
+        vel_change = np.clip(vel_change, -max_vel_change, max_vel_change)
+        self.linear_vel += vel_change
+        self.linear_vel = np.clip(self.linear_vel, -MAX_REVERSE_VEL, MAX_LINEAR_VEL)
         
-        angular_accel = (target_angular - self.angular_vel) / DT
-        angular_accel = np.clip(angular_accel, -MAX_ANGULAR_ACCEL, MAX_ANGULAR_ACCEL)
-        self.angular_vel += angular_accel * DT
-        self.angular_vel = np.clip(self.angular_vel, -MAX_ANGULAR_VEL, MAX_ANGULAR_VEL)
+        # Limit steering rate
+        delta_change = target_delta - self.delta
+        max_delta_change = MAX_STEER_RATE * DT
+        delta_change = np.clip(delta_change, -max_delta_change, max_delta_change)
+        self.delta += delta_change
+        self.delta = np.clip(self.delta, -MAX_STEER, MAX_STEER)
+
+    def update_bicycle_kinematics(self):
+        """
+        Update position and orientation using bicycle/Ackermann model:
+        x_dot = v * cos(theta)
+        y_dot = v * sin(theta)
+        theta_dot = (v / L) * tan(delta)
+        
+        where L is the wheelbase and delta is the steering angle
+        """
+        if abs(self.linear_vel) < 1e-6:
+            return
+        
+        # Bicycle model kinematics
+        self.theta += (self.linear_vel / WHEELBASE) * np.tan(self.delta) * DT
+        self.theta = np.arctan2(np.sin(self.theta), np.cos(self.theta))  # Normalize
+        
+        self.position[0] += self.linear_vel * np.cos(self.theta) * DT
+        self.position[1] += self.linear_vel * np.sin(self.theta) * DT
 
     def update(self, agents):
-        if self.reached:
-            self.linear_vel *= 0.9
-            self.angular_vel *= 0.9
+        # Check if reached goal first
+        if np.linalg.norm(self.position - self.goal) < GOAL_TOL:
+            if not self.reached:
+                # Just reached - stop all motion immediately
+                self.reached = True
+                self.linear_vel = 0.0
+                self.delta = 0.0
             return
         
         # Update replan timer
@@ -301,25 +355,14 @@ class Robot:
         
         desired_angle, desired_speed = self.compute_desired_direction(agents)
         
-        if desired_angle is None:
-            self.reached = True
-            return
+        # Compute bicycle controls
+        target_vel, target_delta = self.bicycle_control(desired_angle, desired_speed)
         
-        target_linear, target_angular = self.differential_drive_control(
-            desired_angle, desired_speed
-        )
+        # Apply limits
+        self.apply_control_limits(target_vel, target_delta)
         
-        self.apply_acceleration_limits(target_linear, target_angular)
-        
-        # Update state using differential drive kinematics
-        self.theta += self.angular_vel * DT
-        self.theta = np.arctan2(np.sin(self.theta), np.cos(self.theta))
-        
-        self.position[0] += self.linear_vel * np.cos(self.theta) * DT
-        self.position[1] += self.linear_vel * np.sin(self.theta) * DT
-        
-        if np.linalg.norm(self.position - self.goal) < GOAL_TOL:
-            self.reached = True
+        # Update kinematics
+        self.update_bicycle_kinematics()
 
 
 # -------------------------------------------------------
@@ -335,9 +378,8 @@ fig, ax = plt.subplots(figsize=(9, 8))
 ax.set_xlim(-WORLD_SIZE, WORLD_SIZE)
 ax.set_ylim(-WORLD_SIZE, WORLD_SIZE)
 ax.set_aspect("equal")
-ax.set_title("Multi-Robot A* with Dynamic Replanning", fontsize=14, fontweight='bold')
+ax.set_title("Multi-Robot A* with Bicycle/Ackermann Kinematics", fontsize=14, fontweight='bold')
 
-# Status text
 status_text = ax.text(
     0.02, 0.98, "",
     transform=ax.transAxes,
@@ -360,21 +402,18 @@ trail_plots = [
     for i in range(N_AGENTS)
 ]
 
-
-# Add replanning indicator (same color path for robots currently replanning)
 replan_plots = [
     ax.plot(
         [], [], 
         linestyle="-", 
         linewidth=3, 
         alpha=0.9,
-        color=agents[i].color        # << match robot color
+        color=agents[i].color
     )[0]
     for i in range(N_AGENTS)
 ]
 
-# Arrow patches to show robot orientation
-from matplotlib.patches import FancyArrow, Circle
+from matplotlib.patches import Circle
 arrows = []
 detection_circles = []
 
@@ -385,10 +424,8 @@ def init():
     status_text.set_text("")
     points.set_data([], [])
 
-    # Clear goal markers in case animation restarts
     goal_markers.clear()
 
-    # Create persistent goal markers colored per robot
     for agent in agents:
         gm, = ax.plot(
             agent.goal[0], agent.goal[1],
@@ -402,11 +439,6 @@ def init():
 
     return [points, goals, status_text] + goal_markers + paths_plots + replan_plots + trail_plots
 
-
-
-# -------------------------------------------------------
-# Animation update
-# -------------------------------------------------------
 rectangles = []
 
 def update(frame):
@@ -415,30 +447,21 @@ def update(frame):
         r.remove()
     rectangles.clear()
 
-
     for agent in agents:
         agent.update(agents)
         agent.trail.append(agent.position.copy())
-
-
-
     
     reached_count = sum(a.reached for a in agents)
     total_replans = sum(a.replan_count for a in agents)
     
     status_text.set_text(
         f"Reached: {reached_count}/{N_AGENTS}\n"
-        # f"Frame: {frame}\n"
         f"Total Replans: {total_replans}"
     )
     
-    # Robot positions
     xs = [a.position[0] for a in agents]
     ys = [a.position[1] for a in agents]
-
-# points.set_data(xs, ys)
     
-    # Goals
     gx = [a.goal[0] for a in agents]
     gy = [a.goal[1] for a in agents]
     
@@ -446,7 +469,6 @@ def update(frame):
         pts = np.array(agent.trail)
         tp.set_data(pts[:, 0], pts[:, 1])
     
-    # Clear old arrows and detection circles
     for arrow in arrows:
         arrow.remove()
     for circle in detection_circles:
@@ -454,12 +476,14 @@ def update(frame):
     arrows.clear()
     detection_circles.clear()
     
-    # Draw rectangles (robots)
+    # Draw rectangles (robots) with color coding for reverse
     for agent in agents:
         if agent.reached:
             color = agent.color
         elif agent.is_replanning:
             color = "yellow"
+        elif agent.is_reversing:
+            color = "orange"  # Orange when reversing
         else:
             color = agent.color
 
@@ -476,7 +500,6 @@ def update(frame):
         ax.add_patch(rect)
         rectangles.append(rect)
 
-        # detection radius circle (unchanged)
         if not agent.reached:
             circle = ax.add_patch(Circle(
                 agent.position, REPLAN_DIST,
@@ -484,9 +507,7 @@ def update(frame):
                 linestyle='--', alpha=0.2
             ))
             detection_circles.append(circle)
-
     
-    # Plot regular paths (green dashed)
     for pl, agent in zip(paths_plots, agents):
         if not agent.is_replanning:
             pts = np.array(agent.path)
@@ -494,9 +515,8 @@ def update(frame):
         else:
             pl.set_data([], [])
     
-    # Highlight paths that were just replanned
     for rpl, agent in zip(replan_plots, agents):
-        if agent.time_since_replan < 0.5:  # Show for 0.5 seconds after replan
+        if agent.time_since_replan < 0.5:
             pts = np.array(agent.path)
             rpl.set_data(pts[:, 0], pts[:, 1])
         else:
@@ -511,8 +531,6 @@ def update(frame):
         + rectangles
         + detection_circles
     )
-
-
 
 anim = FuncAnimation(fig, update, init_func=init, frames=3000, interval=30, blit=True)
 plt.show()
