@@ -140,6 +140,7 @@ class Robot:
         self.idx = idx
         self.color = color
         self.position = np.random.uniform(-WORLD_SIZE, WORLD_SIZE, size=2)
+        self.trail = [ self.position.copy() ]
         self.goal = np.random.uniform(-WORLD_SIZE, WORLD_SIZE, size=2)
         
         # Non-holonomic state
@@ -353,6 +354,12 @@ paths_plots = [
             color=agents[i].color)[0]
     for i in range(N_AGENTS)
 ]
+trail_plots = [
+    ax.plot([], [], linestyle="-", linewidth=1.8, alpha=0.8,
+            color=agents[i].color)[0]
+    for i in range(N_AGENTS)
+]
+
 
 # Add replanning indicator (same color path for robots currently replanning)
 replan_plots = [
@@ -393,7 +400,7 @@ def init():
         )
         goal_markers.append(gm)
 
-    return [points, goals, status_text] + goal_markers + paths_plots + replan_plots
+    return [points, goals, status_text] + goal_markers + paths_plots + replan_plots + trail_plots
 
 
 
@@ -411,6 +418,10 @@ def update(frame):
 
     for agent in agents:
         agent.update(agents)
+        agent.trail.append(agent.position.copy())
+
+
+
     
     reached_count = sum(a.reached for a in agents)
     total_replans = sum(a.replan_count for a in agents)
@@ -424,11 +435,16 @@ def update(frame):
     # Robot positions
     xs = [a.position[0] for a in agents]
     ys = [a.position[1] for a in agents]
+
+# points.set_data(xs, ys)
     
     # Goals
     gx = [a.goal[0] for a in agents]
     gy = [a.goal[1] for a in agents]
     
+    for tp, agent in zip(trail_plots, agents):
+        pts = np.array(agent.trail)
+        tp.set_data(pts[:, 0], pts[:, 1])
     
     # Clear old arrows and detection circles
     for arrow in arrows:
@@ -486,7 +502,15 @@ def update(frame):
         else:
             rpl.set_data([], [])
     
-    return [points, goals, status_text] + paths_plots + replan_plots + rectangles + detection_circles + goal_markers
+    return (
+        [points, status_text]
+        + goal_markers
+        + paths_plots
+        + replan_plots
+        + trail_plots
+        + rectangles
+        + detection_circles
+    )
 
 
 
